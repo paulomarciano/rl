@@ -4,12 +4,10 @@
 # LICENSE file in the root directory of this source tree.
 
 import torch
+from tensordict.tensordict import TensorDictBase
 
-from torchrl.data.tensordict.tensordict import TensorDictBase
 from torchrl.envs import EnvBase
-from torchrl.modules.planners import MPCPlannerBase
-
-__all__ = ["CEMPlanner"]
+from torchrl.modules.planners.common import MPCPlannerBase
 
 
 class CEMPlanner(MPCPlannerBase):
@@ -46,9 +44,10 @@ class CEMPlanner(MPCPlannerBase):
             the action. Defaults to "action"
 
     Examples:
-        >>> from torchrl.data import CompositeSpec, NdUnboundedContinuousTensorSpec, TensorDict
+        >>> from tensordict import TensorDict
+        >>> from torchrl.data import CompositeSpec, NdUnboundedContinuousTensorSpec
         >>> from torchrl.envs.model_based import ModelBasedEnvBase
-        >>> from torchrl.modules import TensorDictModule
+        >>> from torchrl.modules import SafeModule
         >>> class MyMBEnv(ModelBasedEnvBase):
         ...     def __init__(self, world_model, device="cpu", dtype=None, batch_size=None):
         ...         super().__init__(world_model, device=device, dtype=dtype, batch_size=batch_size)
@@ -72,12 +71,12 @@ class CEMPlanner(MPCPlannerBase):
         >>> from torchrl.modules import MLP, WorldModelWrapper
         >>> import torch.nn as nn
         >>> world_model = WorldModelWrapper(
-        ...     TensorDictModule(
+        ...     SafeModule(
         ...         MLP(out_features=4, activation_class=nn.ReLU, activate_last_layer=True, depth=0),
         ...         in_keys=["hidden_observation", "action"],
-        ...         out_keys=["next_hidden_observation"],
+        ...         out_keys=["hidden_observation"],
         ...     ),
-        ...     TensorDictModule(
+        ...     SafeModule(
         ...         nn.Linear(4, 1),
         ...         in_keys=["hidden_observation"],
         ...         out_keys=["reward"],
@@ -153,7 +152,7 @@ class CEMPlanner(MPCPlannerBase):
             actions = actions.flatten(0, 1)
             actions = self.env.action_spec.project(actions)
             optim_tensordict = expanded_original_tensordict.to_tensordict()
-            policy = PrecomputedActionsSequentialSetter(actions)
+            policy = _PrecomputedActionsSequentialSetter(actions)
             optim_tensordict = self.env.rollout(
                 max_steps=self.planning_horizon,
                 policy=policy,
@@ -179,7 +178,7 @@ class CEMPlanner(MPCPlannerBase):
         return actions_means[:, :, 0].reshape(*batch_size, *self.action_spec.shape)
 
 
-class PrecomputedActionsSequentialSetter:
+class _PrecomputedActionsSequentialSetter:
     def __init__(self, actions):
         self.actions = actions
         self.cmpt = 0

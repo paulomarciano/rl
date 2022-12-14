@@ -4,27 +4,21 @@
 # LICENSE file in the root directory of this source tree.
 
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional, Type, Union, Dict, Any
+from typing import Any, Callable, Dict, List, Optional, Type, Union
+
+from tensordict.nn import TensorDictModuleWrapper
+from tensordict.tensordict import TensorDictBase
 
 from torchrl.collectors.collectors import (
     _DataCollector,
-    _MultiDataCollector,
-    SyncDataCollector,
     MultiaSyncDataCollector,
     MultiSyncDataCollector,
+    SyncDataCollector,
 )
 from torchrl.data import MultiStep
-from torchrl.data.tensordict.tensordict import TensorDictBase
 from torchrl.envs import ParallelEnv
 from torchrl.envs.common import EnvBase
-from torchrl.modules import TensorDictModuleWrapper, ProbabilisticTensorDictModule
-
-__all__ = [
-    "sync_sync_collector",
-    "sync_async_collector",
-    "make_collector_offpolicy",
-    "make_collector_onpolicy",
-]
+from torchrl.modules import SafeProbabilisticSequential
 
 
 def sync_async_collector(
@@ -181,9 +175,9 @@ def _make_collector(
     num_env_per_collector: Optional[int] = None,
     num_collectors: Optional[int] = None,
     **kwargs,
-) -> _MultiDataCollector:
+) -> _DataCollector:
     if env_kwargs is None:
-        env_kwargs = dict()
+        env_kwargs = {}
     if isinstance(env_fns, list):
         num_env = len(env_fns)
         if num_env_per_collector is None:
@@ -226,7 +220,7 @@ def _make_collector(
         env_kwargs = [_env_kwargs[0] for _env_kwargs in env_kwargs_split]
     else:
         env_fns = [
-            lambda: ParallelEnv(
+            lambda _env_fn=_env_fn, _env_kwargs=_env_kwargs: ParallelEnv(
                 num_workers=len(_env_fn),
                 create_env_fn=_env_fn,
                 create_env_kwargs=_env_kwargs,
@@ -255,7 +249,7 @@ def _make_collector(
 
 def make_collector_offpolicy(
     make_env: Callable[[], EnvBase],
-    actor_model_explore: Union[TensorDictModuleWrapper, ProbabilisticTensorDictModule],
+    actor_model_explore: Union[TensorDictModuleWrapper, SafeProbabilisticSequential],
     cfg: "DictConfig",  # noqa: F821
     make_env_kwargs: Optional[Dict] = None,
 ) -> _DataCollector:
@@ -263,7 +257,7 @@ def make_collector_offpolicy(
 
     Args:
         make_env (Callable): environment creator
-        actor_model_explore (TensorDictModule): Model instance used for evaluation and exploration update
+        actor_model_explore (SafeModule): Model instance used for evaluation and exploration update
         cfg (DictConfig): config for creating collector object
         make_env_kwargs (dict): kwargs for the env creator
 
@@ -319,7 +313,7 @@ def make_collector_offpolicy(
 
 def make_collector_onpolicy(
     make_env: Callable[[], EnvBase],
-    actor_model_explore: Union[TensorDictModuleWrapper, ProbabilisticTensorDictModule],
+    actor_model_explore: Union[TensorDictModuleWrapper, SafeProbabilisticSequential],
     cfg: "DictConfig",  # noqa: F821
     make_env_kwargs: Optional[Dict] = None,
 ) -> _DataCollector:
@@ -327,7 +321,7 @@ def make_collector_onpolicy(
 
     Args:
         make_env (Callable): environment creator
-        actor_model_explore (TensorDictModule): Model instance used for evaluation and exploration update
+        actor_model_explore (SafeModule): Model instance used for evaluation and exploration update
         cfg (DictConfig): config for creating collector object
         make_env_kwargs (dict): kwargs for the env creator
 
@@ -373,6 +367,8 @@ def make_collector_onpolicy(
 
 @dataclass
 class OnPolicyCollectorConfig:
+    """On-policy collector config struct."""
+
     collector_devices: Any = field(default_factory=lambda: ["cpu"])
     # device on which the data collector should store the trajectories to be passed to this script.
     # If the collector device differs from the policy device (cuda:0 if available), then the
@@ -416,6 +412,8 @@ class OnPolicyCollectorConfig:
 
 @dataclass
 class OffPolicyCollectorConfig(OnPolicyCollectorConfig):
+    """Off-policy collector config struct."""
+
     multi_step: bool = False
     # whether or not multi-step rewards should be used.
     n_steps_return: int = 3

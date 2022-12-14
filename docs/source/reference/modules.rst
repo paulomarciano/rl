@@ -11,10 +11,10 @@ TensorDict modules
     :toctree: generated/
     :template: rl_template_noinherit.rst
 
-    TensorDictModule
-    ProbabilisticTensorDictModule
-    TensorDictSequential
-    TensorDictModuleWrapper
+    SafeModule
+    SafeProbabilisticModule
+    SafeSequential
+    SafeProbabilisticSequential
     Actor
     ProbabilisticActor
     ValueOperator
@@ -23,6 +23,8 @@ TensorDict modules
     ActorValueOperator
     ActorCriticOperator
     ActorCriticWrapper
+    tensordict_module.common.is_tensordict_compatible
+    tensordict_module.common.ensure_tensordict_compatible
 
 Hooks
 -----
@@ -99,6 +101,8 @@ Distributions
 Utils
 -----
 
+.. currentmodule:: torchrl.modules.utils
+
 .. autosummary::
     :toctree: generated/
     :template: rl_template_noinherit.rst
@@ -106,5 +110,8 @@ Utils
     mappings
     inv_softplus
     biased_softplus
+
+.. currentmodule:: torchrl.modules.models.utils
+
     SqueezeLayer
     Squeeze2dLayer

@@ -12,36 +12,21 @@ from textwrap import indent
 from typing import (
     Any,
     Dict,
+    ItemsView,
+    KeysView,
     List,
     Optional,
     Sequence,
     Tuple,
     Union,
-    ItemsView,
-    KeysView,
     ValuesView,
 )
 
 import numpy as np
 import torch
-
-__all__ = [
-    "TensorSpec",
-    "BoundedTensorSpec",
-    "OneHotDiscreteTensorSpec",
-    "UnboundedContinuousTensorSpec",
-    "UnboundedDiscreteTensorSpec",
-    "NdBoundedTensorSpec",
-    "NdUnboundedContinuousTensorSpec",
-    "NdUnboundedDiscreteTensorSpec",
-    "BinaryDiscreteTensorSpec",
-    "MultOneHotDiscreteTensorSpec",
-    "DiscreteTensorSpec",
-    "CompositeSpec",
-]
+from tensordict.tensordict import TensorDict, TensorDictBase
 
 from torchrl._utils import get_binary_env_var
-from torchrl.data.tensordict.tensordict import TensorDictBase, TensorDict
 
 _CHECK_IMAGES = get_binary_env_var("CHECK_IMAGES")
 
@@ -75,7 +60,7 @@ class invertible_dict(dict):
 
     def __init__(self, *args, inv_dict=None, **kwargs):
         if inv_dict is None:
-            inv_dict = dict()
+            inv_dict = {}
         super().__init__(*args, **kwargs)
         self.inv_dict = inv_dict
 
@@ -109,11 +94,6 @@ class Box:
 
     def __repr__(self):
         return f"{self.__class__.__name__}()"
-
-
-@dataclass(repr=False)
-class Values:
-    values: Tuple
 
 
 @dataclass(repr=False)
@@ -439,8 +419,8 @@ class BoundedTensorSpec(TensorSpec):
         if shape is None:
             shape = torch.Size([])
         a, b = self.space
-        shape = [*shape, *self.shape]
         if self.dtype in (torch.float, torch.double, torch.half):
+            shape = [*shape, *self.shape]
             out = (
                 torch.zeros(shape, dtype=self.dtype, device=self.device).uniform_()
                 * (b - a)
@@ -453,7 +433,7 @@ class BoundedTensorSpec(TensorSpec):
             return out
         else:
             interval = self.space.maximum - self.space.minimum
-            r = torch.rand(*interval.shape, device=interval.device)
+            r = torch.rand(*shape, *interval.shape, device=interval.device)
             r = interval * r
             r = self.space.minimum + r
             r = r.to(self.dtype).to(self.device)
@@ -465,6 +445,11 @@ class BoundedTensorSpec(TensorSpec):
         try:
             val = val.clamp_(minimum.item(), maximum.item())
         except ValueError:
+            minimum = minimum.expand_as(val)
+            maximum = maximum.expand_as(val)
+            val[val < minimum] = minimum[val < minimum]
+            val[val > maximum] = maximum[val > maximum]
+        except RuntimeError:
             minimum = minimum.expand_as(val)
             maximum = maximum.expand_as(val)
             val[val < minimum] = minimum[val < minimum]
@@ -667,7 +652,7 @@ class UnboundedDiscreteTensorSpec(TensorSpec):
         if shape is None:
             shape = torch.Size([])
         interval = self.space.maximum - self.space.minimum
-        r = torch.rand(interval.shape, device=interval.device)
+        r = torch.rand(*shape, *interval.shape, device=interval.device)
         r = r * interval
         r = self.space.minimum + r
         r = r.to(self.dtype)
@@ -818,9 +803,15 @@ class NdUnboundedDiscreteTensorSpec(UnboundedDiscreteTensorSpec):
             shape = torch.Size([shape])
 
         dtype, device = _default_dtype_and_device(dtype, device)
+        if dtype == torch.bool:
+            min_value = False
+            max_value = True
+        else:
+            min_value = torch.iinfo(dtype).min
+            max_value = torch.iinfo(dtype).max
         space = ContinuousBox(
-            torch.full(shape, torch.iinfo(dtype).min, device=device),
-            torch.full(shape, torch.iinfo(dtype).max, device=device),
+            torch.full(shape, min_value, device=device),
+            torch.full(shape, max_value, device=device),
         )
 
         super(UnboundedDiscreteTensorSpec, self).__init__(
@@ -1038,8 +1029,12 @@ class DiscreteTensorSpec(TensorSpec):
     def rand(self, shape=None) -> torch.Tensor:
         if shape is None:
             shape = torch.Size([])
-        return (torch.rand(*shape, *self.shape, device=self.device) * self.space.n).to(
-            torch.long
+        return torch.randint(
+            0,
+            self.space.n,
+            torch.Size([*shape, *self.shape]),
+            device=self.device,
+            dtype=self.dtype,
         )
 
     def _project(self, val: torch.Tensor) -> torch.Tensor:
@@ -1068,6 +1063,9 @@ class CompositeSpec(TensorSpec):
     """A composition of TensorSpecs.
 
     Args:
+        *args: if an unnamed argument is passed, it must be a dictionary with keys
+            matching the expected keys to be found in the :obj:`CompositeSpec` object.
+            This is useful to build nested CompositeSpecs with tuple indices.
         **kwargs (key (str): value (TensorSpec)): dictionary of tensorspecs
             to be stored. Values can be None, in which case is_in will be assumed
             to be :obj:`True` for the corresponding tensors, and :obj:`project()` will have no
@@ -1099,13 +1097,29 @@ class CompositeSpec(TensorSpec):
         >>> print("random td: ", composite_spec.rand([3,]))
         random td:  TensorDict(
             fields={
-                pixels: Tensor(torch.Size([3, 3, 32, 32]), \
-dtype=torch.float32),
-                observation_vector: Tensor(torch.Size([3, 33]), \
-dtype=torch.float32)},
+                observation_vector: Tensor(torch.Size([3, 33]), dtype=torch.float32),
+                pixels: Tensor(torch.Size([3, 3, 32, 32]), dtype=torch.float32)},
             batch_size=torch.Size([3]),
-            device=cpu,
+            device=None,
             is_shared=False)
+
+
+    Examples:
+        >>> # we can build a nested composite spec using unnamed arguments
+        >>> print(CompositeSpec({("a", "b"): None, ("a", "c"): None}))
+        CompositeSpec(
+            a: CompositeSpec(
+                b: None,
+                c: None))
+
+    CompositeSpec supports nested indexing:
+        >>> spec = CompositeSpec(obs=None)
+        >>> spec["nested", "x"] = None
+        >>> print(spec)
+        CompositeSpec(
+            nested: CompositeSpec(
+                x: None),
+            x: None)
 
     """
 
@@ -1116,7 +1130,7 @@ dtype=torch.float32)},
         cls._device = torch.device("cpu")
         return super().__new__(cls)
 
-    def __init__(self, **kwargs):
+    def __init__(self, *args, **kwargs):
         self._specs = kwargs
         if len(kwargs):
             _device = None
@@ -1131,6 +1145,24 @@ dtype=torch.float32)},
                         f"All devices of CompositeSpec must match."
                     )
             self._device = _device
+        if len(args):
+            if not len(kwargs):
+                self._device = None
+            if len(args) > 1:
+                raise RuntimeError(
+                    "Got multiple arguments, when at most one is expected for CompositeSpec."
+                )
+            argdict = args[0]
+            if not isinstance(argdict, dict):
+                raise RuntimeError(
+                    f"Expected a dictionary of specs, but got an argument of type {type(argdict)}."
+                )
+            for k, item in argdict.items():
+                if item is None:
+                    continue
+                if self._device is None:
+                    self._device = item.device
+                self[k] = item
 
     @property
     def device(self) -> DEVICE_TYPING:
@@ -1154,11 +1186,26 @@ dtype=torch.float32)},
         self._device = value
 
     def __getitem__(self, item):
+        if isinstance(item, tuple) and len(item) > 1:
+            return self[item[0]][item[1:]]
+        elif isinstance(item, tuple):
+            return self[item[0]]
+
         if item in {"shape", "device", "dtype", "space"}:
             raise AttributeError(f"CompositeSpec has no key {item}")
         return self._specs[item]
 
     def __setitem__(self, key, value):
+        if isinstance(key, tuple) and len(key) > 1:
+            if key[0] not in self.keys(True):
+                self[key[0]] = CompositeSpec()
+            self[key[0]][key[1:]] = value
+            return
+        elif isinstance(key, tuple):
+            self[key[0]] = value
+            return
+        elif not isinstance(key, str):
+            raise TypeError(f"Got key of type {type(key)} when a string was expected.")
         if key in {"shape", "device", "dtype", "space"}:
             raise AttributeError(f"CompositeSpec[{key}] cannot be set")
         if value is not None and value.device != self.device:
@@ -1176,13 +1223,21 @@ dtype=torch.float32)},
         del self._specs[key]
 
     def encode(self, vals: Dict[str, Any]) -> Dict[str, torch.Tensor]:
-        out = {}
+        if isinstance(vals, TensorDict):
+            out = vals.select()  # create and empty tensordict similar to vals
+        else:
+            out = TensorDict({}, [], _run_checks=False)
         for key, item in vals.items():
             if item is None:
                 raise RuntimeError(
                     "CompositeSpec.encode cannot be used with missing values."
                 )
-            out[key] = self[key].encode(item)
+            try:
+                out[key] = self[key].encode(item)
+            except KeyError:
+                raise KeyError(
+                    f"The CompositeSpec instance with keys {self.keys()} does not have a '{key}' key."
+                )
         return out
 
     def __repr__(self) -> str:
@@ -1228,17 +1283,26 @@ dtype=torch.float32)},
     def rand(self, shape=None) -> TensorDictBase:
         if shape is None:
             shape = torch.Size([])
+        _dict = {
+            key: self[key].rand(shape)
+            for key in self.keys(True)
+            if isinstance(key, str) and self[key] is not None
+        }
         return TensorDict(
-            {
-                key: value.rand(shape)
-                for key, value in self._specs.items()
-                if value is not None
-            },
+            _dict,
             batch_size=shape,
         )
 
-    def keys(self) -> KeysView:
-        return self._specs.keys()
+    def keys(self, yield_nesting_keys: bool = False) -> KeysView:
+        """Keys of the CompositeSpec.
+
+        Args:
+            yield_nesting_keys (bool, optional): if :obj:`True`, the values returned
+                will contain every level of nesting, i.e. a :obj:`CompositeSpec(next=CompositeSpec(obs=None))`
+                will lead to the keys :obj:`["next", ("next", "obs")]`. Default is :obj:`False`, i.e.
+                only nested keys will be returned.
+        """
+        return _CompositeSpecKeysView(self, _yield_nesting_keys=yield_nesting_keys)
 
     def items(self) -> ItemsView:
         return self._specs.items()
@@ -1269,7 +1333,11 @@ dtype=torch.float32)},
         if shape is None:
             shape = torch.Size([])
         return TensorDict(
-            {key: self[key].zero(shape) for key in self.keys()},
+            {
+                key: self[key].zero(shape)
+                for key in self.keys(True)
+                if isinstance(key, str) and self[key] is not None
+            },
             shape,
             device=self.device,
         )
@@ -1283,6 +1351,64 @@ dtype=torch.float32)},
 
     def update(self, dict_or_spec: Union[CompositeSpec, Dict[str, TensorSpec]]) -> None:
         for key, item in dict_or_spec.items():
+            if key in self.keys(True) and isinstance(self[key], CompositeSpec):
+                self[key].update(item)
+                continue
             if isinstance(item, TensorSpec) and item.device != self.device:
                 item = deepcopy(item).to(self.device)
             self[key] = item
+
+
+def _keys_to_empty_composite_spec(keys):
+    if not len(keys):
+        return
+    c = CompositeSpec()
+    for key in keys:
+        if isinstance(key, str):
+            c[key] = None
+        elif key[0] in c.keys(yield_nesting_keys=True):
+            if c[key[0]] is None:
+                # if the value is None we just replace it
+                c[key[0]] = _keys_to_empty_composite_spec([key[1:]])
+            elif isinstance(c[key[0]], CompositeSpec):
+                # if the value is Composite, we update it
+                out = _keys_to_empty_composite_spec([key[1:]])
+                if out is not None:
+                    c[key[0]].update(out)
+            else:
+                raise RuntimeError("Conflicting keys")
+        else:
+            c[key[0]] = _keys_to_empty_composite_spec(key[1:])
+    return c
+
+
+class _CompositeSpecKeysView:
+    """Wrapper class that enables richer behaviour of `key in tensordict.keys()`."""
+
+    def __init__(
+        self,
+        composite: CompositeSpec,
+        nested_keys: bool = True,
+        _yield_nesting_keys: bool = False,
+    ):
+        self.composite = composite
+        self._yield_nesting_keys = _yield_nesting_keys
+        self.nested_keys = nested_keys
+
+    def __iter__(
+        self,
+    ):
+        for key, item in self.composite.items():
+            if self.nested_keys and isinstance(item, CompositeSpec):
+                for subkey in item.keys():
+                    yield (key, *subkey) if isinstance(subkey, tuple) else (key, subkey)
+                if self._yield_nesting_keys:
+                    yield key
+            else:
+                yield key
+
+    def __len__(self):
+        i = 0
+        for _ in self:
+            i += 1
+        return i

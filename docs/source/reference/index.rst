@@ -2,7 +2,7 @@ API Reference
 =============
 
 .. toctree::
-    :maxdepth: 1
+    :maxdepth: 3
 
     collectors
     data
@@ -10,3 +10,4 @@ API Reference
     modules
     objectives
     trainers
+    utils

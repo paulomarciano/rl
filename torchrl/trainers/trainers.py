@@ -5,17 +5,33 @@
 
 from __future__ import annotations
 
+import abc
 import pathlib
 import warnings
-from collections import OrderedDict, defaultdict
+from collections import defaultdict, OrderedDict
+from copy import deepcopy
 from textwrap import indent
-from typing import Callable, Dict, Optional, Union, Sequence, Tuple, Type, List, Any
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Type, Union
 
 import numpy as np
 import torch.nn
+from tensordict.tensordict import pad, TensorDictBase
+from tensordict.utils import expand_right
 from torch import nn, optim
 
-from torchrl._utils import KeyDependentDefaultDict
+from torchrl._utils import _CKPT_BACKEND, KeyDependentDefaultDict
+from torchrl.collectors.collectors import _DataCollector
+from torchrl.data import (
+    ReplayBuffer,
+    TensorDictPrioritizedReplayBuffer,
+    TensorDictReplayBuffer,
+)
+from torchrl.data.utils import DEVICE_TYPING
+from torchrl.envs.common import EnvBase
+from torchrl.envs.utils import set_exploration_mode
+from torchrl.modules import SafeModule
+from torchrl.objectives.common import LossModule
+from torchrl.trainers.loggers import Logger
 
 try:
     from tqdm import tqdm
@@ -24,19 +40,12 @@ try:
 except ImportError:
     _has_tqdm = False
 
-from torchrl.collectors.collectors import _DataCollector
-from torchrl.data import (
-    ReplayBuffer,
-    TensorDictPrioritizedReplayBuffer,
-    TensorDictReplayBuffer,
-)
-from torchrl.data.tensordict.tensordict import TensorDictBase, pad
-from torchrl.data.utils import expand_right, DEVICE_TYPING
-from torchrl.envs.common import EnvBase
-from torchrl.envs.utils import set_exploration_mode
-from torchrl.modules import TensorDictModule
-from torchrl.objectives.common import LossModule
-from torchrl.trainers.loggers import Logger
+try:
+    from torchsnapshot import Snapshot, StateDict
+
+    _has_ts = True
+except ImportError:
+    _has_ts = False
 
 REPLAY_BUFFER_CLASS = {
     "prioritized": TensorDictPrioritizedReplayBuffer,
@@ -48,20 +57,23 @@ LOGGER_METHODS = {
     "loss": "log_scalar",
 }
 
-__all__ = [
-    "Trainer",
-    "BatchSubSampler",
-    "CountFramesLog",
-    "LogReward",
-    "Recorder",
-    "ReplayBuffer",
-    "RewardNormalizer",
-    "SelectKeys",
-    "UpdateWeights",
-    "ClearCudaCache",
-]
-
 TYPE_DESCR = {float: "4.4f", int: ""}
+
+
+class TrainerHookBase:
+    """An abstract hooking class for torchrl Trainer class."""
+
+    @abc.abstractmethod
+    def state_dict(self) -> Dict[str, Any]:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def register(self, trainer: Trainer, name: str):
+        raise NotImplementedError
 
 
 class Trainer:
@@ -108,12 +120,17 @@ class Trainer:
             Default is None (no saving)
     """
 
-    # trackers
-    _optim_count: int = 0
-    _collected_frames: int = 0
-    _last_log: Dict[str, Any] = {}
-    _last_save: int = 0
-    _log_interval: int = 10000
+    @classmethod
+    def __new__(cls, *args, **kwargs):
+        # trackers
+        cls._optim_count: int = 0
+        cls._collected_frames: int = 0
+        cls._last_log: Dict[str, Any] = {}
+        cls._last_save: int = 0
+        cls._log_interval: int = 10000
+        cls.collected_frames = 0
+        cls._app_state = None
+        return super().__new__(cls)
 
     def __init__(
         self,
@@ -121,7 +138,7 @@ class Trainer:
         total_frames: int,
         frame_skip: int,
         loss_module: Union[LossModule, Callable[[TensorDictBase], TensorDictBase]],
-        optimizer: optim.Optimizer,
+        optimizer: Optional[optim.Optimizer] = None,
         logger: Optional[Logger] = None,
         optim_steps_per_batch: int = 500,
         clip_grad_norm: bool = True,
@@ -138,9 +155,6 @@ class Trainer:
         self.loss_module = loss_module
         self.optimizer = optimizer
         self.logger = logger
-        self._params = []
-        for p in self.optimizer.param_groups:
-            self._params += p["params"]
 
         # seeding
         self.seed = seed
@@ -169,8 +183,87 @@ class Trainer:
         self._post_optim_log_ops = []
         self._pre_optim_ops = []
         self._post_loss_ops = []
+        self._optimizer_ops = []
         self._process_optim_batch_ops = []
         self._post_optim_ops = []
+        self._modules = {}
+
+        if self.optimizer is not None:
+            optimizer_hook = OptimizerHook(self.optimizer)
+            optimizer_hook.register(self)
+
+    def register_module(self, module_name: str, module: Any) -> None:
+        if module_name in self._modules:
+            raise RuntimeError(
+                f"{module_name} is already registered, choose a different name."
+            )
+        self._modules[module_name] = module
+
+    def _get_state(self):
+        if _CKPT_BACKEND == "torchsnapshot":
+            state = StateDict(
+                collected_frames=self.collected_frames,
+                _last_log=self._last_log,
+                _last_save=self._last_save,
+                _optim_count=self._optim_count,
+            )
+        else:
+            state = OrderedDict(
+                collected_frames=self.collected_frames,
+                _last_log=self._last_log,
+                _last_save=self._last_save,
+                _optim_count=self._optim_count,
+            )
+        return state
+
+    @property
+    def app_state(self):
+        self._app_state = {
+            "state": StateDict(**self._get_state()),
+            "collector": self.collector,
+            "loss_module": self.loss_module,
+            **{k: item for k, item in self._modules.items()},
+        }
+        return self._app_state
+
+    def state_dict(self) -> Dict:
+        state = self._get_state()
+        state_dict = OrderedDict(
+            collector=self.collector.state_dict(),
+            loss_module=self.loss_module.state_dict(),
+            state=state,
+            **{k: item.state_dict() for k, item in self._modules.items()},
+        )
+        return state_dict
+
+    def load_state_dict(self, state_dict: Dict) -> None:
+        model_state_dict = state_dict["loss_module"]
+        collector_state_dict = state_dict["collector"]
+
+        self.loss_module.load_state_dict(model_state_dict)
+        self.collector.load_state_dict(collector_state_dict)
+        for key, item in self._modules.items():
+            item.load_state_dict(state_dict[key])
+
+        self.collected_frames = state_dict["state"]["collected_frames"]
+        self._last_log = state_dict["state"]["_last_log"]
+        self._last_save = state_dict["state"]["_last_save"]
+        self._optim_count = state_dict["state"]["_optim_count"]
+
+    def _save_trainer(self) -> None:
+        if _CKPT_BACKEND == "torchsnapshot":
+            if not _has_ts:
+                raise ImportError(
+                    "torchsnapshot not found. Consider installing torchsnapshot or "
+                    "using the torch checkpointing backend (`CKPT_BACKEND=torch`)"
+                )
+            Snapshot.take(app_state=self.app_state, path=self.save_trainer_file)
+        elif _CKPT_BACKEND == "torch":
+            torch.save(self.state_dict(), self.save_trainer_file)
+        else:
+            raise NotImplementedError(
+                f"CKPT_BACKEND should be one of {_CKPT_BACKEND.backends}, got {_CKPT_BACKEND}."
+            )
 
     def save_trainer(self, force_save: bool = False) -> None:
         _save = force_save
@@ -179,58 +272,21 @@ class Trainer:
                 self._last_save = self.collected_frames
                 _save = True
         if _save and self.save_trainer_file:
-            torch.save(self.state_dict(), self.save_trainer_file)
+            self._save_trainer()
 
     def load_from_file(self, file: Union[str, pathlib.Path]) -> Trainer:
-        loaded_dict: OrderedDict = torch.load(file)
-
-        # checks that keys match
-        expected_keys = {
-            "env",
-            "loss_module",
-            "_last_log",
-            "_last_save",
-            "_optim_count",
-        }
-        actual_keys = set(loaded_dict.keys())
-        if len(actual_keys.difference(expected_keys)) or len(
-            expected_keys.difference(actual_keys)
-        ):
-            raise RuntimeError(
-                f"Expected keys {expected_keys} in the loaded file but got"
-                f" {actual_keys}"
-            )
-        self.collector.load_state_dict(loaded_dict["env"])
-        self.model.load_state_dict(loaded_dict["model"])
-        for key in [
-            "_last_log",
-            "_last_save",
-            "_optim_count",
-        ]:
-            setattr(self, key, loaded_dict[key])
+        if _CKPT_BACKEND == "torchsnapshot":
+            snapshot = Snapshot(path=file)
+            snapshot.restore(app_state=self.app_state)
+        elif _CKPT_BACKEND == "torch":
+            loaded_dict: OrderedDict = torch.load(file)
+            self.load_state_dict(loaded_dict)
         return self
 
     def set_seed(self):
         seed = self.collector.set_seed(self.seed, static_seed=False)
         torch.manual_seed(seed)
         np.random.seed(seed)
-
-    def state_dict(self) -> Dict:
-        state_dict = OrderedDict(
-            env=self.collector.state_dict(),
-            loss_module=self.loss_module.state_dict(),
-            _collected_frames=self.collected_frames,
-            _last_log=self._last_log,
-            _last_save=self._last_save,
-            _optim_count=self._optim_count,
-        )
-        return state_dict
-
-    def load_state_dict(self, state_dict: Dict) -> None:
-        model_state_dict = state_dict["loss_module"]
-        env_state_dict = state_dict["env"]
-        self.loss_module.load_state_dict(model_state_dict)
-        self.collector.load_state_dict(env_state_dict)
 
     @property
     def collector(self) -> _DataCollector:
@@ -262,6 +318,12 @@ class Trainer:
                 op, input=TensorDictBase, output=TensorDictBase
             )
             self._post_loss_ops.append((op, kwargs))
+
+        elif dest == "optimizer":
+            _check_input_output_typehint(
+                op, input=[TensorDictBase, bool, float, int], output=TensorDictBase
+            )
+            self._optimizer_ops.append((op, kwargs))
 
         elif dest == "post_steps":
             _check_input_output_typehint(op, input=None, output=None)
@@ -332,6 +394,13 @@ class Trainer:
                 batch = out
         return batch
 
+    def _optimizer_hook(self, batch):
+        for i, (op, kwargs) in enumerate(self._optimizer_ops):
+            out = op(batch, self.clip_grad_norm, self.clip_norm, i, **kwargs)
+            if isinstance(out, TensorDictBase):
+                batch = out
+        return batch.detach()
+
     def _post_optim_hook(self):
         for op, kwargs in self._post_optim_ops:
             op(**kwargs)
@@ -351,9 +420,7 @@ class Trainer:
     def train(self):
         if self.progress_bar:
             self._pbar = tqdm(total=self.total_frames)
-            self._pbar_str = dict()
-
-        self.collected_frames = 0
+            self._pbar_str = {}
 
         for batch in self.collector:
             batch = self._process_batch_hook(batch)
@@ -388,16 +455,6 @@ class Trainer:
         print("shutting down collector")
         self.collector.shutdown()
 
-    def _optimizer_step(self, losses_td: TensorDictBase) -> TensorDictBase:
-        # sum all keys that start with 'loss_'
-        loss = sum([item for key, item in losses_td.items() if key.startswith("loss")])
-        loss.backward()
-
-        grad_norm = self._grad_clip()
-        self.optimizer.step()
-        self.optimizer.zero_grad()
-        return losses_td.detach().set("grad_norm", grad_norm)
-
     def optim_steps(self, batch: TensorDictBase) -> None:
         average_losses = None
 
@@ -410,7 +467,7 @@ class Trainer:
             losses_td = self.loss_module(sub_batch)
             self._post_loss_hook(sub_batch)
 
-            losses_detached = self._optimizer_step(losses_td)
+            losses_detached = self._optimizer_hook(losses_td)
             self._post_optim_hook()
             self._post_optim_log(sub_batch)
 
@@ -427,16 +484,6 @@ class Trainer:
                 optim_steps=self._optim_count,
                 **average_losses,
             )
-
-    def _grad_clip(self) -> float:
-        if self.clip_grad_norm:
-            gn = nn.utils.clip_grad_norm_(self._params, self.clip_norm)
-        else:
-            gn = sum(
-                [p.grad.pow(2).sum() for p in self._params if p.grad is not None]
-            ).sqrt()
-            nn.utils.clip_grad_value_(self._params, self.clip_norm)
-        return float(gn)
 
     def _log(self, log_pbar=False, **kwargs) -> None:
         collected_frames = self.collected_frames
@@ -485,7 +532,26 @@ class Trainer:
         return string
 
 
-class SelectKeys:
+def _get_list_state_dict(hook_list):
+    out = []
+    for item, kwargs in hook_list:
+        if hasattr(item, "state_dict"):
+            out.append((item.state_dict(), kwargs))
+        else:
+            out.append((None, kwargs))
+    return out
+
+
+def _load_list_state_dict(list_state_dict, hook_list):
+    for i, ((state_dict_item, kwargs), (item, _)) in enumerate(
+        zip(list_state_dict, hook_list)
+    ):
+        if state_dict_item is not None:
+            item.load_state_dict(state_dict_item)
+            hook_list[i] = (item, kwargs)
+
+
+class SelectKeys(TrainerHookBase):
     """Selects keys in a TensorDict batch.
 
     Args:
@@ -519,8 +585,18 @@ class SelectKeys:
     def __call__(self, batch: TensorDictBase) -> TensorDictBase:
         return batch.select(*self.keys)
 
+    def state_dict(self) -> Dict[str, Any]:
+        return {}
 
-class ReplayBufferTrainer:
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        pass
+
+    def register(self, trainer, name="select_keys") -> None:
+        trainer.register_op("batch_process", self)
+        trainer.register_module(name, self)
+
+
+class ReplayBufferTrainer(TrainerHookBase):
     """Replay buffer hook provider.
 
     Args:
@@ -600,8 +676,101 @@ class ReplayBufferTrainer:
         if isinstance(self.replay_buffer, TensorDictPrioritizedReplayBuffer):
             self.replay_buffer.update_priority(batch)
 
+    def state_dict(self) -> Dict[str, Any]:
+        return {
+            "replay_buffer": self.replay_buffer.state_dict(),
+        }
 
-class ClearCudaCache:
+    def load_state_dict(self, state_dict) -> None:
+        self.replay_buffer.load_state_dict(state_dict["replay_buffer"])
+
+    def register(self, trainer: Trainer, name: str = "replay_buffer"):
+        trainer.register_op("batch_process", self.extend)
+        trainer.register_op("process_optim_batch", self.sample)
+        trainer.register_op("post_loss", self.update_priority)
+        trainer.register_module(name, self)
+
+
+class OptimizerHook(TrainerHookBase):
+    """Add an optimizer for one or more loss components.
+
+    Args:
+        optimizer (optim.Optimizer): An optimizer to apply to the loss_components.
+        loss_components (Sequence[str], optional): The keys in the loss TensorDict
+            for which the optimizer should be appled to the respective values.
+            If omitted, the optimizer is applied to all components with the
+            names starting with `loss_`.
+
+    Examples:
+        >>> optimizer_hook = OptimizerHook(optimizer, ["loss_actor"])
+        >>> trainer.register_op("optimizer", optimizer_hook)
+
+    """
+
+    def __init__(
+        self,
+        optimizer: optim.Optimizer,
+        loss_components: Optional[Sequence[str]] = None,
+    ):
+        if loss_components is not None and not loss_components:
+            raise ValueError(
+                "loss_components list cannot be empty. "
+                "Set to None to act on all components of the loss."
+            )
+
+        self.optimizer = optimizer
+        self.loss_components = loss_components
+        if self.loss_components is not None:
+            self.loss_components = set(self.loss_components)
+
+    def _grad_clip(self, clip_grad_norm: bool, clip_norm: float) -> float:
+        params = []
+        for param_group in self.optimizer.param_groups:
+            params += param_group["params"]
+
+        if clip_grad_norm:
+            gn = nn.utils.clip_grad_norm_(params, clip_norm)
+        else:
+            gn = sum([p.grad.pow(2).sum() for p in params if p.grad is not None]).sqrt()
+            nn.utils.clip_grad_value_(params, clip_norm)
+
+        return float(gn)
+
+    def __call__(
+        self,
+        losses_td: TensorDictBase,
+        clip_grad_norm: bool,
+        clip_norm: float,
+        index: int,
+    ) -> TensorDictBase:
+        loss_components = (
+            [item for key, item in losses_td.items() if key in self.loss_components]
+            if self.loss_components is not None
+            else [item for key, item in losses_td.items() if key.startswith("loss")]
+        )
+        loss = sum(loss_components)
+        loss.backward()
+
+        grad_norm = self._grad_clip(clip_grad_norm, clip_norm)
+        losses_td[f"grad_norm_{index}"] = torch.tensor(grad_norm)
+
+        self.optimizer.step()
+        self.optimizer.zero_grad()
+
+        return losses_td
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {}
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        pass
+
+    def register(self, trainer, name="optimizer") -> None:
+        trainer.register_op("optimizer", self)
+        trainer.register_module(name, self)
+
+
+class ClearCudaCache(TrainerHookBase):
     """Clears cuda cache at a given interval.
 
     Examples:
@@ -620,7 +789,7 @@ class ClearCudaCache:
             torch.cuda.empty_cache()
 
 
-class LogReward:
+class LogReward(TrainerHookBase):
     """Reward logger hook.
 
     Args:
@@ -651,8 +820,12 @@ class LogReward:
             "log_pbar": self.log_pbar,
         }
 
+    def register(self, trainer: Trainer, name: str = "log_reward"):
+        trainer.register_op("pre_steps_log", self)
+        trainer.register_module(name, self)
 
-class RewardNormalizer:
+
+class RewardNormalizer(TrainerHookBase):
     """Reward normalizer hook.
 
     Args:
@@ -727,6 +900,23 @@ class RewardNormalizer:
         self._normalize_has_been_called = True
         return tensordict
 
+    def state_dict(self) -> Dict[str, Any]:
+        return {
+            "_reward_stats": deepcopy(self._reward_stats),
+            "scale": self.scale,
+            "_normalize_has_been_called": self._normalize_has_been_called,
+            "_update_has_been_called": self._update_has_been_called,
+        }
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        for key, value in state_dict.items():
+            setattr(self, key, value)
+
+    def register(self, trainer: Trainer, name: str = "reward_normalizer"):
+        trainer.register_op("batch_process", self.update_reward_stats)
+        trainer.register_op("process_optim_batch", self.normalize_reward)
+        trainer.register_module(name, self)
+
 
 def mask_batch(batch: TensorDictBase) -> TensorDictBase:
     """Batch masking hook.
@@ -749,7 +939,7 @@ def mask_batch(batch: TensorDictBase) -> TensorDictBase:
     return batch
 
 
-class BatchSubSampler:
+class BatchSubSampler(TrainerHookBase):
     """Data subsampler for online RL algorithms.
 
     This class subsamples a part of a whole batch of data just collected from the
@@ -772,7 +962,7 @@ class BatchSubSampler:
         ...         key1: torch.stack([torch.arange(0, 10), torch.arange(10, 20)], 0),
         ...         key2: torch.stack([torch.arange(0, 10), torch.arange(10, 20)], 0),
         ...     },
-        ...     [13, 10],
+        ...     [2, 10],
         ... )
         >>> trainer.register_op(
         ...     "process_optim_batch",
@@ -863,8 +1053,21 @@ class BatchSubSampler:
             raise RuntimeError("Sampled invalid steps")
         return td
 
+    def state_dict(self) -> Dict[str, Any]:
+        return {}
 
-class Recorder:
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        pass
+
+    def register(self, trainer: Trainer, name: str = "batch_subsampler"):
+        trainer.register_op(
+            "process_optim_batch",
+            self,
+        )
+        trainer.register_module(name, self)
+
+
+class Recorder(TrainerHookBase):
     """Recorder hook for Trainer.
 
     Args:
@@ -907,7 +1110,7 @@ class Recorder:
         record_interval: int,
         record_frames: int,
         frame_skip: int,
-        policy_exploration: TensorDictModule,
+        policy_exploration: SafeModule,
         recorder: EnvBase,
         exploration_mode: str = "random",
         log_keys: Optional[List[str]] = None,
@@ -952,7 +1155,7 @@ class Recorder:
                 self.recorder.train()
                 self.recorder.transform.dump(suffix=self.suffix)
 
-                out = dict()
+                out = {}
                 for key in self.log_keys:
                     value = td_record.get(key).float()
                     if key == "reward":
@@ -969,8 +1172,25 @@ class Recorder:
         self.recorder.close()
         return out
 
+    def state_dict(self) -> Dict:
+        return {
+            "_count": self._count,
+            "recorder_state_dict": self.recorder.state_dict(),
+        }
 
-class UpdateWeights:
+    def load_state_dict(self, state_dict: Dict) -> None:
+        self._count = state_dict["_count"]
+        self.recorder.load_state_dict(state_dict["recorder_state_dict"])
+
+    def register(self, trainer: Trainer, name: str = "recorder"):
+        trainer.register_module(name, self)
+        trainer.register_op(
+            "post_steps_log",
+            self,
+        )
+
+
+class UpdateWeights(TrainerHookBase):
     """A collector weights update hook class.
 
     This hook must be used whenever the collector policy weights sit on a
@@ -1000,8 +1220,21 @@ class UpdateWeights:
         if self.counter % self.update_weights_interval == 0:
             self.collector.update_policy_weights_()
 
+    def register(self, trainer: Trainer, name: str = "update_weights"):
+        trainer.register_module(name, self)
+        trainer.register_op(
+            "post_steps",
+            self,
+        )
 
-class CountFramesLog:
+    def state_dict(self) -> Dict:
+        return {}
+
+    def load_state_dict(self, state_dict) -> None:
+        return
+
+
+class CountFramesLog(TrainerHookBase):
     """A frame counter hook.
 
     Args:
@@ -1018,8 +1251,12 @@ class CountFramesLog:
 
     """
 
+    @classmethod
+    def __new__(cls, *args, **kwargs):
+        cls.frame_count = 0
+        return super().__new__(cls)
+
     def __init__(self, frame_skip: int, log_pbar: bool = False):
-        self.frame_count = 0
         self.frame_skip = frame_skip
         self.log_pbar = log_pbar
 
@@ -1031,7 +1268,35 @@ class CountFramesLog:
         self.frame_count += current_frames
         return {"n_frames": self.frame_count, "log_pbar": self.log_pbar}
 
+    def register(self, trainer: Trainer, name: str = "count_frames_log"):
+        trainer.register_module(name, self)
+        trainer.register_op(
+            "pre_steps_log",
+            self,
+        )
 
-def _check_input_output_typehint(func: Callable, input: Type, output: Type):
+    def state_dict(self) -> Dict:
+        return {"frame_count": self.frame_count}
+
+    def load_state_dict(self, state_dict) -> None:
+        self.frame_count = state_dict["frame_count"]
+
+
+def _check_input_output_typehint(
+    func: Callable, input: Type | List[Type], output: Type
+):
     # Placeholder for a function that checks the types input / output against expectations
     return
+
+
+def flatten_dict(d):
+    """Flattens a dictionary with sub-dictionaries accessed through point-separated (:obj:`"var1.var2"`) fields."""
+    out = {}
+    for key, item in d.items():
+        if isinstance(item, dict):
+            item = flatten_dict(item)
+            for _key, _item in item.items():
+                out[".".join([key, _key])] = _item
+        else:
+            out[key] = item
+    return out

@@ -11,14 +11,6 @@
 
 # TorchRL
 
-## Disclaimer
-
-This library is not officially released yet and is subject to change.
-
-The features are available before an official release so that users and collaborators can get early access and provide feedback. No guarantee of stability, robustness or backward compatibility is provided.
-
----
-
 **TorchRL** is an open-source Reinforcement Learning (RL) library for PyTorch.
 
 It provides pytorch and **python-first**, low and high level abstractions for RL that are intended to be **efficient**, **modular**, **documented** and properly **tested**.
@@ -31,116 +23,134 @@ On the low-level end, torchrl comes with a set of highly re-usable functionals f
 
 TorchRL aims at (1) a high modularity and (2) good runtime performance.
 
-## Features
+## Documentation
 
-On the high-level end, TorchRL provides:
-- [`TensorDict`](torchrl/data/tensordict/tensordict.py),
+The TorchRL documentation can be found [here](https://pytorch.org/rl).
+It contains tutorials and the API reference.
+
+## TensorDict as a common data carrier for RL
+
+TorchRL relies on [`TensorDict`](https://github.com/pytorch-labs/tensordict/),
 a convenient data structure<sup>(1)</sup> to pass data from
 one object to another without friction.
 `TensorDict` makes it easy to re-use pieces of code across environments, models and
 algorithms. For instance, here's how to code a rollout in TorchRL:
-    <details>
-      <summary>Code</summary>
+  <details>
+    <summary>Code</summary>
 
-    ```diff
-    - obs, done = env.reset()
-    + tensordict = env.reset()
-    policy = TensorDictModule(
-        model,
-        in_keys=["observation_pixels", "observation_vector"],
-        out_keys=["action"],
-    )
-    out = []
-    for i in range(n_steps):
-    -     action, log_prob = policy(obs)
-    -     next_obs, reward, done, info = env.step(action)
-    -     out.append((obs, next_obs, action, log_prob, reward, done))
-    -     obs = next_obs
-    +     tensordict = policy(tensordict)
-    +     tensordict = env.step(tensordict)
-    +     out.append(tensordict)
-    +     tensordict = step_mdp(tensordict)  # renames next_observation_* keys to observation_*
-    - obs, next_obs, action, log_prob, reward, done = [torch.stack(vals, 0) for vals in zip(*out)]
-    + out = torch.stack(out, 0)  # TensorDict supports multiple tensor operations
-    ```
-    TensorDict abstracts away the input / output signatures of the modules, env, collectors, replay buffers and losses of the library, allowing its primitives
-    to be easily recycled across settings.
-    Here's another example of an off-policy training loop in TorchRL (assuming that a data collector, a replay buffer, a loss and an optimizer have been instantiated):
+  ```diff
+  - obs, done = env.reset()
+  + tensordict = env.reset()
+  policy = SafeModule(
+      model,
+      in_keys=["observation_pixels", "observation_vector"],
+      out_keys=["action"],
+  )
+  out = []
+  for i in range(n_steps):
+  -     action, log_prob = policy(obs)
+  -     next_obs, reward, done, info = env.step(action)
+  -     out.append((obs, next_obs, action, log_prob, reward, done))
+  -     obs = next_obs
+  +     tensordict = policy(tensordict)
+  +     tensordict = env.step(tensordict)
+  +     out.append(tensordict)
+  +     tensordict = step_mdp(tensordict)  # renames next_observation_* keys to observation_*
+  - obs, next_obs, action, log_prob, reward, done = [torch.stack(vals, 0) for vals in zip(*out)]
+  + out = torch.stack(out, 0)  # TensorDict supports multiple tensor operations
+  ```
+  </details>
+TensorDict abstracts away the input / output signatures of the modules, env, collectors, replay buffers and losses of the library, allowing its primitives
+to be easily recycled across settings.
+Here's another example of an off-policy training loop in TorchRL (assuming that a data collector, a replay buffer, a loss and an optimizer have been instantiated):
 
-    ```diff
-    - for i, (obs, next_obs, action, hidden_state, reward, done) in enumerate(collector):
-    + for i, tensordict in enumerate(collector):
-    -     replay_buffer.add((obs, next_obs, action, log_prob, reward, done))
-    +     replay_buffer.add(tensordict)
-        for j in range(num_optim_steps):
-    -         obs, next_obs, action, hidden_state, reward, done = replay_buffer.sample(batch_size)
-    -         loss = loss_fn(obs, next_obs, action, hidden_state, reward, done)
-    +         tensordict = replay_buffer.sample(batch_size)
-    +         loss = loss_fn(tensordict)
-            loss.backward()
-            optim.step()
-            optim.zero_grad()
-    ```
-    Again, this training loop can be re-used across algorithms as it makes a minimal number of assumptions about the structure of the data.
+  <details>
+    <summary>Code</summary>
 
-    TensorDict supports multiple tensor operations on its device and shape
-    (the shape of TensorDict, or its batch size, is the common arbitrary N first dimensions of all its contained tensors):
-    ```python
-    # stack and cat
-    tensordict = torch.stack(list_of_tensordicts, 0)
-    tensordict = torch.cat(list_of_tensordicts, 0)
-    # reshape
-    tensordict = tensordict.view(-1)
-    tensordict = tensordict.permute(0, 2, 1)
-    tensordict = tensordict.unsqueeze(-1)
-    tensordict = tensordict.squeeze(-1)
-    # indexing
-    tensordict = tensordict[:2]
-    tensordict[:, 2] = sub_tensordict
-    # device and memory location
-    tensordict.cuda()
-    tensordict.to("cuda:1")
-    tensordict.share_memory_()
-    ```
-    </details>
+  ```diff
+  - for i, (obs, next_obs, action, hidden_state, reward, done) in enumerate(collector):
+  + for i, tensordict in enumerate(collector):
+  -     replay_buffer.add((obs, next_obs, action, log_prob, reward, done))
+  +     replay_buffer.add(tensordict)
+      for j in range(num_optim_steps):
+  -         obs, next_obs, action, hidden_state, reward, done = replay_buffer.sample(batch_size)
+  -         loss = loss_fn(obs, next_obs, action, hidden_state, reward, done)
+  +         tensordict = replay_buffer.sample(batch_size)
+  +         loss = loss_fn(tensordict)
+          loss.backward()
+          optim.step()
+          optim.zero_grad()
+  ```
+  Again, this training loop can be re-used across algorithms as it makes a minimal number of assumptions about the structure of the data.
+  </details>
 
-    Check our [TensorDict tutorial](tutorials/tensordict.ipynb) for more information.
+  TensorDict supports multiple tensor operations on its device and shape
+  (the shape of TensorDict, or its batch size, is the common arbitrary N first dimensions of all its contained tensors):
 
-- An associated [`TensorDictModule` class](torchrl/modules/tensordict_module/common.py) which is [functorch](https://github.com/pytorch/functorch)-compatible!
-    <details>
-      <summary>Code</summary>
+  <details>
+    <summary>Code</summary>
 
-    ```diff
-    transformer_model = nn.Transformer(nhead=16, num_encoder_layers=12)
-    + td_module = TensorDictModule(transformer_model, in_keys=["src", "tgt"], out_keys=["out"])
-    src = torch.rand((10, 32, 512))
-    tgt = torch.rand((20, 32, 512))
-    + tensordict = TensorDict({"src": src, "tgt": tgt}, batch_size=[20, 32])
-    - out = transformer_model(src, tgt)
-    + td_module(tensordict)
-    + out = tensordict["out"]
-    ```
+  ```python
+  # stack and cat
+  tensordict = torch.stack(list_of_tensordicts, 0)
+  tensordict = torch.cat(list_of_tensordicts, 0)
+  # reshape
+  tensordict = tensordict.view(-1)
+  tensordict = tensordict.permute(0, 2, 1)
+  tensordict = tensordict.unsqueeze(-1)
+  tensordict = tensordict.squeeze(-1)
+  # indexing
+  tensordict = tensordict[:2]
+  tensordict[:, 2] = sub_tensordict
+  # device and memory location
+  tensordict.cuda()
+  tensordict.to("cuda:1")
+  tensordict.share_memory_()
+  ```
+  </details>
 
-    The `TensorDictSequential` class allows to branch sequences of `nn.Module` instances in a highly modular way.
-    For instance, here is an implementation of a transformer using the encoder and decoder blocks:
-    ```python
-    encoder_module = TransformerEncoder(...)
-    encoder = TensorDictModule(encoder_module, in_keys=["src", "src_mask"], out_keys=["memory"])
-    decoder_module = TransformerDecoder(...)
-    decoder = TensorDictModule(decoder_module, in_keys=["tgt", "memory"], out_keys=["output"])
-    transformer = TensorDictSequential(encoder, decoder)
-    assert transformer.in_keys == ["src", "src_mask", "tgt"]
-    assert transformer.out_keys == ["memory", "output"]
-    ```
+Check our TorchRL-specific [TensorDict tutorial](https://pytorch.org/rl/tutorials/tensordict_tutorial.html) for more information.
 
-    `TensorDictSequential` allows to isolate subgraphs by querying a set of desired input / output keys:
-    ```python
-    transformer.select_subsequence(out_keys=["memory"])  # returns the encoder
-    transformer.select_subsequence(in_keys=["tgt", "memory"])  # returns the decoder
-    ```
-    </details>
+The associated [`SafeModule` class](torchrl/modules/tensordict_module/common.py) which is [functorch](https://github.com/pytorch/functorch)-compatible!
 
-    The corresponding [tutorial](tutorials/tensordictmodule.ipynb) provides more context about its features.
+  <details>
+    <summary>Code</summary>
+
+  ```diff
+  transformer_model = nn.Transformer(nhead=16, num_encoder_layers=12)
+  + td_module = SafeModule(transformer_model, in_keys=["src", "tgt"], out_keys=["out"])
+  src = torch.rand((10, 32, 512))
+  tgt = torch.rand((20, 32, 512))
+  + tensordict = TensorDict({"src": src, "tgt": tgt}, batch_size=[20, 32])
+  - out = transformer_model(src, tgt)
+  + td_module(tensordict)
+  + out = tensordict["out"]
+  ```
+
+  The `SafeSequential` class allows to branch sequences of `nn.Module` instances in a highly modular way.
+  For instance, here is an implementation of a transformer using the encoder and decoder blocks:
+  ```python
+  encoder_module = TransformerEncoder(...)
+  encoder = SafeModule(encoder_module, in_keys=["src", "src_mask"], out_keys=["memory"])
+  decoder_module = TransformerDecoder(...)
+  decoder = SafeModule(decoder_module, in_keys=["tgt", "memory"], out_keys=["output"])
+  transformer = SafeSequential(encoder, decoder)
+  assert transformer.in_keys == ["src", "src_mask", "tgt"]
+  assert transformer.out_keys == ["memory", "output"]
+  ```
+
+  `SafeSequential` allows to isolate subgraphs by querying a set of desired input / output keys:
+  ```python
+  transformer.select_subsequence(out_keys=["memory"])  # returns the encoder
+  transformer.select_subsequence(in_keys=["tgt", "memory"])  # returns the decoder
+  ```
+  </details>
+
+  The corresponding [tutorial](https://pytorch.org/rl/tutorials/tensordict_module.html) provides more context about its features.
+
+
+
+## Features
 
 - a generic [trainer class](torchrl/trainers/trainers.py)<sup>(1)</sup> that
     executes the aforementioned training loop. Through a hooking mechanism,
@@ -242,7 +252,7 @@ algorithms. For instance, here's how to code a rollout in TorchRL:
     ```
     </details>
 
-- various tools for distributed learning (e.g. [memory mapped tensors](torchrl/data/tensordict/memmap.py))<sup>(2)</sup>;
+- various tools for distributed learning (e.g. [memory mapped tensors](https://github.com/pytorch-labs/tensordict/blob/main/tensordict/memmap.py))<sup>(2)</sup>;
 - various [architectures](torchrl/modules/models/) and models (e.g. [actor-critic](torchrl/modules/tensordict_module/actors.py))<sup>(1)</sup>:
     <details>
       <summary>Code</summary>
@@ -256,33 +266,32 @@ algorithms. For instance, here's how to code a rollout in TorchRL:
         kernel_sizes=[8, 4, 3],
         strides=[4, 2, 1],
     )
-    # Wrap it in a TensorDictModule, indicating what key to read in and where to
+    # Wrap it in a SafeModule, indicating what key to read in and where to
     # write out the output
-    common_module = TensorDictModule(
+    common_module = SafeModule(
         common_module,
         in_keys=["pixels"],
         out_keys=["hidden"],
     )
     # Wrap the policy module in NormalParamsWrapper, such that the output
     # tensor is split in loc and scale, and scale is mapped onto a positive space
-    policy_module = NormalParamsWrapper(
-        MLP(
-            num_cells=[64, 64],
-            out_features=32,
-            activation=nn.ELU,
-        )
-    )
-    # Wrap the nn.Module in a ProbabilisticTensorDictModule, indicating how
-    # to build the torch.distribution.Distribution object and what to do with it
-    policy_module = ProbabilisticTensorDictModule(  # stochastic policy
-        TensorDictModule(
-            policy_module,
-            in_keys=["hidden"],
-            out_keys=["loc", "scale"],
+    policy_module = SafeModule(
+        NormalParamsWrapper(
+            MLP(num_cells=[64, 64], out_features=32, activation=nn.ELU)
         ),
-        dist_in_keys=["loc", "scale"],
-        sample_out_key="action",
-        distribution_class=TanhNormal,
+        in_keys=["hidden"],
+        out_keys=["loc", "scale"],
+    )
+    # Use a SafeProbabilisticSequential to combine the SafeModule with a
+    # SafeProbabilisticModule, indicating how to build the
+    # torch.distribution.Distribution object and what to do with it
+    policy_module = SafeProbabilisticSequential(  # stochastic policy
+        policy_module,
+        SafeProbabilisticModule(
+            in_keys=["loc", "scale"],
+            out_keys="action",
+            distribution_class=TanhNormal,
+        ),
     )
     value_module = MLP(
         num_cells=[64, 64],
@@ -345,14 +354,16 @@ If you would like to contribute to new features, check our [call for contributio
 A series of [examples](examples/) are provided with an illustrative purpose:
 - [DQN (and add-ons up to Rainbow)](examples/dqn/dqn.py)
 - [DDPG](examples/ddpg/ddpg.py)
+- [A2C](examples/a2c/a2c.py)
 - [PPO](examples/ppo/ppo.py)
 - [SAC](examples/sac/sac.py)
 - [REDQ](examples/redq/redq.py)
+- [Dreamer](examples/dreamer/dreamer.py)
 
 and many more to come!
 
-We also provide [tutorials and demos](tutorials) that give a sense of what the
-library can do.
+We also provide [tutorials and demos](tutorials/README.md) that give a sense of
+what the library can do.
 
 ## Installation
 Create a conda environment where the packages will be installed.
@@ -375,7 +386,7 @@ conda install pytorch torchvision torchaudio cudatoolkit=11.6 -c pytorch -c cond
 # For CPU-only build
 conda install pytorch torchvision cpuonly -c pytorch
 
-# Functorch will be integrated in torch from 1.13. As of now, we still need the latest pip release
+# For torch 1.12 (and not above), one should install functorch separately:
 pip3 install functorch
 ```
 
@@ -402,7 +413,7 @@ pip3 install torchrl
 This should work on linux and MacOs (not M1). For Windows and M1/M2 machines, one
 should install the library locally (see below).
 
-The **nightly build** can be installed via 
+The **nightly build** can be installed via
 ```
 pip install torchrl-nightly
 ```
@@ -424,9 +435,10 @@ git clone https://github.com/pytorch/rl
 Go to the directory where you have cloned the torchrl repo and install it
 ```
 cd /path/to/torchrl/
-python setup.py develop
+pip install -e .
 ```
 
+On M1 machines, this should work out-of-the-box with the nightly build of PyTorch.
 If the generation of this artifact in MacOs M1 doesn't work correctly or in the execution the message
 `(mach-o file, but is an incompatible architecture (have 'x86_64', need 'arm64e'))` appears, then try
 
@@ -498,6 +510,9 @@ and not
 OS: macOS **** (x86_64)
 ```
 
+Versioning issues can cause error message of the type ```undefined symbol``` and such. For these, refer to the [versioning issues document](knowledge_base/VERSIONING_ISSUES.md) for a complete explanation and proposed workarounds.
+
+
 ## Running examples
 Examples are coded in a very similar way but the configuration may change from one algorithm to another (e.g. async/sync data collection, hyperparameters, ratio of model updates / frame etc.)
 
@@ -521,6 +536,13 @@ In the near future, we plan to:
 
 We welcome any contribution, should you want to contribute to these new features
 or any other, lister or not, in the issues section of this repository.
+
+
+## Disclaimer
+
+This library is not officially released yet and is subject to change.
+
+The features are available before an official release so that users and collaborators can get early access and provide feedback. No guarantee of stability, robustness or backward compatibility is provided.
 
 # License
 TorchRL is licensed under the MIT License. See [LICENSE](LICENSE) for details.

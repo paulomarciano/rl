@@ -9,12 +9,13 @@ import pytest
 import torch
 from _utils_internal import get_available_devices
 from mocking_classes import MockBatchedUnLockedEnv
+from packaging import version
+from tensordict import TensorDict
 from torch import nn
-from torchrl.data import TensorDict
 from torchrl.data.tensor_specs import (
     DiscreteTensorSpec,
-    OneHotDiscreteTensorSpec,
     NdBoundedTensorSpec,
+    OneHotDiscreteTensorSpec,
 )
 from torchrl.modules import (
     ActorValueOperator,
@@ -22,23 +23,27 @@ from torchrl.modules import (
     LSTMNet,
     ProbabilisticActor,
     QValueActor,
-    TensorDictModule,
+    SafeModule,
     ValueOperator,
-)
-from torchrl.modules.functional_modules import (
-    FunctionalModule,
-    FunctionalModuleWithBuffers,
 )
 from torchrl.modules.models import ConvNet, MLP, NoisyLazyLinear, NoisyLinear
 from torchrl.modules.models.model_based import (
     DreamerActor,
-    ObsEncoder,
     ObsDecoder,
-    RSSMPrior,
+    ObsEncoder,
     RSSMPosterior,
+    RSSMPrior,
     RSSMRollout,
 )
 from torchrl.modules.models.utils import SquashDims
+
+
+@pytest.fixture
+def double_prec_fixture():
+    dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.double)
+    yield
+    torch.set_default_dtype(dtype)
 
 
 @pytest.mark.parametrize("in_features", [3, 10, None])
@@ -115,7 +120,9 @@ def test_mlp(
 )
 @pytest.mark.parametrize("squeeze_output", [False])
 @pytest.mark.parametrize("device", get_available_devices())
+@pytest.mark.parametrize("batch", [(2,), (2, 2)])
 def test_convnet(
+    batch,
     in_features,
     depth,
     num_cells,
@@ -136,7 +143,6 @@ def test_convnet(
     seed=0,
 ):
     torch.manual_seed(seed)
-    batch = 2
     convnet = ConvNet(
         in_features=in_features,
         depth=depth,
@@ -156,9 +162,9 @@ def test_convnet(
     )
     if in_features is None:
         in_features = 5
-    x = torch.randn(batch, in_features, input_size, input_size, device=device)
+    x = torch.randn(*batch, in_features, input_size, input_size, device=device)
     y = convnet(x)
-    assert y.shape == torch.Size([batch, expected_features])
+    assert y.shape == torch.Size([*batch, expected_features])
 
 
 @pytest.mark.parametrize(
@@ -249,12 +255,12 @@ def test_value_based_policy_categorical(device):
 
 @pytest.mark.parametrize("device", get_available_devices())
 def test_actorcritic(device):
-    common_module = TensorDictModule(
-        spec=None, module=nn.Linear(3, 4), in_keys=["obs"], out_keys=["hidden"]
+    common_module = SafeModule(
+        module=nn.Linear(3, 4), in_keys=["obs"], out_keys=["hidden"], spec=None
     ).to(device)
-    module = TensorDictModule(nn.Linear(4, 5), in_keys=["hidden"], out_keys=["param"])
+    module = SafeModule(nn.Linear(4, 5), in_keys=["hidden"], out_keys=["param"])
     policy_operator = ProbabilisticActor(
-        spec=None, module=module, dist_in_keys=["param"], return_log_prob=True
+        module=module, in_keys=["param"], spec=None, return_log_prob=True
     ).to(device)
     value_operator = ValueOperator(nn.Linear(4, 1), in_keys=["hidden"]).to(device)
     op = ActorValueOperator(
@@ -301,7 +307,16 @@ def test_actorcritic(device):
 @pytest.mark.parametrize("hidden_size", [8, 9])
 @pytest.mark.parametrize("num_layers", [1, 2])
 @pytest.mark.parametrize("has_precond_hidden", [True, False])
-def test_lstm_net(device, out_features, hidden_size, num_layers, has_precond_hidden):
+def test_lstm_net(
+    device,
+    out_features,
+    hidden_size,
+    num_layers,
+    has_precond_hidden,
+    double_prec_fixture,
+):
+
+    torch.manual_seed(0)
     batch = 5
     time_steps = 6
     in_features = 7
@@ -422,28 +437,6 @@ def test_lstm_net_nobatch(device, out_features, hidden_size):
     torch.testing.assert_close(tds_vec["hidden1_out"][-1], tds_loop["hidden1_out"][-1])
 
 
-class TestFunctionalModules:
-    def test_func_seq(self):
-        module = nn.Sequential(nn.Linear(3, 4), nn.Linear(4, 3))
-        fmodule, params = FunctionalModule._create_from(module)
-        x = torch.randn(3)
-        assert (fmodule(params, x) == module(x)).all()
-
-    def test_func_bn(self):
-        module = nn.Sequential(nn.Linear(3, 4), nn.BatchNorm1d(4))
-        module.eval()
-        fmodule, params, buffers = FunctionalModuleWithBuffers._create_from(module)
-        x = torch.randn(10, 3)
-        assert (fmodule(params, buffers, x) == module(x)).all()
-
-    def test_func_transformer(self):
-        module = nn.Transformer(128)
-        module.eval()
-        fmodule, params, buffers = FunctionalModuleWithBuffers._create_from(module)
-        x = torch.randn(10, 128)
-        torch.testing.assert_close(fmodule(params, buffers, x, x), module(x, x))
-
-
 class TestPlanner:
     @pytest.mark.parametrize("device", get_available_devices())
     @pytest.mark.parametrize("batch_size", [3, 5])
@@ -471,6 +464,12 @@ class TestPlanner:
 
 @pytest.mark.parametrize("device", get_available_devices())
 @pytest.mark.parametrize("batch_size", [[], [3], [5]])
+@pytest.mark.skipif(
+    version.parse(torch.__version__) < version.parse("1.11.0"),
+    reason="""Dreamer works with batches of null to 2 dimensions. Torch < 1.11
+requires one-dimensional batches (for RNN and Conv nets for instance). If you'd like
+to see torch < 1.11 supported for dreamer, please submit an issue.""",
+)
 class TestDreamerComponents:
     @pytest.mark.parametrize("out_features", [3, 5])
     @pytest.mark.parametrize("temporal_size", [[], [2], [4]])
@@ -582,23 +581,23 @@ class TestDreamerComponents:
         ).to(device)
 
         rssm_rollout = RSSMRollout(
-            TensorDictModule(
+            SafeModule(
                 rssm_prior,
                 in_keys=["state", "belief", "action"],
                 out_keys=[
-                    "next_prior_mean",
-                    "next_prior_std",
+                    ("next", "prior_mean"),
+                    ("next", "prior_std"),
                     "_",
-                    "next_belief",
+                    ("next", "belief"),
                 ],
             ),
-            TensorDictModule(
+            SafeModule(
                 rssm_posterior,
-                in_keys=["next_belief", "next_encoded_latents"],
+                in_keys=[("next", "belief"), ("next", "encoded_latents")],
                 out_keys=[
-                    "next_posterior_mean",
-                    "next_posterior_std",
-                    "next_state",
+                    ("next", "posterior_mean"),
+                    ("next", "posterior_std"),
+                    ("next", "state"),
                 ],
             ),
         )
@@ -611,9 +610,11 @@ class TestDreamerComponents:
         tensordict = TensorDict(
             {
                 "state": state.clone(),
-                "next_belief": belief.clone(),
                 "action": action.clone(),
-                "next_encoded_latents": obs_emb.clone(),
+                "next": {
+                    "encoded_latents": obs_emb.clone(),
+                    "belief": belief.clone(),
+                },
             },
             device=device,
             batch_size=torch.Size([*batch_size, temporal_size]),
@@ -622,30 +623,38 @@ class TestDreamerComponents:
         _ = rssm_rollout(tensordict.clone())
         torch.manual_seed(0)
         rollout = rssm_rollout(tensordict)
-        assert rollout["next_prior_mean"].shape == (
+        assert rollout["next", "prior_mean"].shape == (
             *batch_size,
             temporal_size,
             deter_size,
         )
-        assert rollout["next_prior_std"].shape == (
+        assert rollout["next", "prior_std"].shape == (
             *batch_size,
             temporal_size,
             deter_size,
         )
-        assert rollout["next_state"].shape == (*batch_size, temporal_size, deter_size)
-        assert rollout["next_belief"].shape == (*batch_size, temporal_size, stoch_size)
-        assert rollout["next_posterior_mean"].shape == (
+        assert rollout["next", "state"].shape == (
             *batch_size,
             temporal_size,
             deter_size,
         )
-        assert rollout["next_posterior_std"].shape == (
+        assert rollout["next", "belief"].shape == (
+            *batch_size,
+            temporal_size,
+            stoch_size,
+        )
+        assert rollout["next", "posterior_mean"].shape == (
             *batch_size,
             temporal_size,
             deter_size,
         )
-        assert torch.all(rollout["next_prior_std"] > 0)
-        assert torch.all(rollout["next_posterior_std"] > 0)
+        assert rollout["next", "posterior_std"].shape == (
+            *batch_size,
+            temporal_size,
+            deter_size,
+        )
+        assert torch.all(rollout["next", "prior_std"] > 0)
+        assert torch.all(rollout["next", "posterior_std"] > 0)
 
         state[..., 1:, :] = 0
         belief[..., 1:, :] = 0
@@ -654,9 +663,8 @@ class TestDreamerComponents:
         tensordict_bis = TensorDict(
             {
                 "state": state.clone(),
-                "next_belief": belief.clone(),
                 "action": action.clone(),
-                "next_encoded_latents": obs_emb.clone(),
+                "next": {"encoded_latents": obs_emb.clone(), "belief": belief.clone()},
             },
             device=device,
             batch_size=torch.Size([*batch_size, temporal_size]),
@@ -665,16 +673,18 @@ class TestDreamerComponents:
         rollout_bis = rssm_rollout(tensordict_bis)
 
         assert torch.allclose(
-            rollout["next_prior_mean"], rollout_bis["next_prior_mean"]
-        ), (rollout["next_prior_mean"] - rollout_bis["next_prior_mean"]).norm()
-        assert torch.allclose(rollout["next_prior_std"], rollout_bis["next_prior_std"])
-        assert torch.allclose(rollout["next_state"], rollout_bis["next_state"])
-        assert torch.allclose(rollout["next_belief"], rollout_bis["next_belief"])
+            rollout["next", "prior_mean"], rollout_bis["next", "prior_mean"]
+        ), (rollout["next", "prior_mean"] - rollout_bis["next", "prior_mean"]).norm()
         assert torch.allclose(
-            rollout["next_posterior_mean"], rollout_bis["next_posterior_mean"]
+            rollout["next", "prior_std"], rollout_bis["next", "prior_std"]
+        )
+        assert torch.allclose(rollout["next", "state"], rollout_bis["next", "state"])
+        assert torch.allclose(rollout["next", "belief"], rollout_bis["next", "belief"])
+        assert torch.allclose(
+            rollout["next", "posterior_mean"], rollout_bis["next", "posterior_mean"]
         )
         assert torch.allclose(
-            rollout["next_posterior_std"], rollout_bis["next_posterior_std"]
+            rollout["next", "posterior_std"], rollout_bis["next", "posterior_std"]
         )
 
 

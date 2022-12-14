@@ -2,9 +2,16 @@ import argparse
 import tempfile
 
 import pytest
-from torch.utils.tensorboard import SummaryWriter
+from _utils_internal import PONG_VERSIONED
 from torchrl.envs.libs.dm_control import _has_dmc, DMControlEnv
 from torchrl.envs.libs.gym import _has_gym, GymEnv
+
+try:
+    from torch.utils.tensorboard import SummaryWriter
+
+    _has_tb = True
+except ImportError:
+    _has_tb = False
 
 
 def test_dm_control():
@@ -28,11 +35,12 @@ def test_gym():
     import gym  # noqa: F401
 
     assert _has_gym
-    env = GymEnv("ALE/Pong-v5")
+    env = GymEnv(PONG_VERSIONED)
     env.reset()
 
 
 def test_tb():
+    assert _has_tb
     test_rounds = 100
     while test_rounds > 0:
         try:

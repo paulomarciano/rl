@@ -4,31 +4,32 @@
 # LICENSE file in the root directory of this source tree.
 
 from dataclasses import dataclass
-from typing import Optional, Union, List
+from typing import List, Optional, Union
 from warnings import warn
 
 import torch
+from tensordict.nn import TensorDictModuleWrapper
 from torch import optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from torchrl.collectors.collectors import _DataCollector
 from torchrl.data import ReplayBuffer
 from torchrl.envs.common import EnvBase
-from torchrl.modules import TensorDictModule, TensorDictModuleWrapper, reset_noise
+from torchrl.modules import reset_noise, SafeModule
 from torchrl.objectives.common import LossModule
 from torchrl.objectives.utils import TargetNetUpdater
 from torchrl.trainers.loggers import Logger
 from torchrl.trainers.trainers import (
-    Trainer,
-    SelectKeys,
-    ReplayBufferTrainer,
-    LogReward,
-    RewardNormalizer,
     BatchSubSampler,
-    UpdateWeights,
-    Recorder,
-    CountFramesLog,
     ClearCudaCache,
+    CountFramesLog,
+    LogReward,
+    Recorder,
+    ReplayBufferTrainer,
+    RewardNormalizer,
+    SelectKeys,
+    Trainer,
+    UpdateWeights,
 )
 
 OPTIMIZERS = {
@@ -37,13 +38,11 @@ OPTIMIZERS = {
     "adamax": optim.Adamax,
 }
 
-__all__ = [
-    "make_trainer",
-]
-
 
 @dataclass
 class TrainerConfig:
+    """Trainer config struct."""
+
     optim_steps_per_batch: int = 500
     # Number of optimization steps in between two collection of data. See frames_per_batch below.
     optimizer: str = "adam"
@@ -81,9 +80,7 @@ def make_trainer(
     loss_module: LossModule,
     recorder: Optional[EnvBase] = None,
     target_net_updater: Optional[TargetNetUpdater] = None,
-    policy_exploration: Optional[
-        Union[TensorDictModuleWrapper, TensorDictModule]
-    ] = None,
+    policy_exploration: Optional[Union[TensorDictModuleWrapper, SafeModule]] = None,
     replay_buffer: Optional[ReplayBuffer] = None,
     logger: Optional[Logger] = None,
     cfg: "DictConfig" = None,  # noqa: F821
@@ -115,7 +112,7 @@ def make_trainer(
         >>> from torchrl.collectors.collectors import SyncDataCollector
         >>> from torchrl.data import TensorDictReplayBuffer
         >>> from torchrl.envs.libs.gym import GymEnv
-        >>> from torchrl.modules import TensorDictModuleWrapper, TensorDictModule, ValueOperator, EGreedyWrapper
+        >>> from torchrl.modules import TensorDictModuleWrapper, SafeModule, ValueOperator, EGreedyWrapper
         >>> from torchrl.objectives.common import LossModule
         >>> from torchrl.objectives.utils import TargetNetUpdater
         >>> from torchrl.objectives import DDPGLoss
@@ -125,7 +122,7 @@ def make_trainer(
         >>> action_spec = env_proof.action_spec
         >>> net = torch.nn.Linear(env_proof.observation_spec.shape[-1], action_spec.shape[-1])
         >>> net_value = torch.nn.Linear(env_proof.observation_spec.shape[-1], 1)  # for the purpose of testing
-        >>> policy = TensorDictModule(action_spec, net, in_keys=["observation"], out_keys=["action"])
+        >>> policy = SafeModule(action_spec, net, in_keys=["observation"], out_keys=["action"])
         >>> value = ValueOperator(net_value, in_keys=["observation"], out_keys=["state_action_value"])
         >>> collector = SyncDataCollector(env_maker, policy, total_frames=100)
         >>> loss_module = DDPGLoss(policy, value, gamma=0.99)
@@ -224,6 +221,7 @@ def make_trainer(
             "process_optim_batch",
             BatchSubSampler(batch_size=cfg.batch_size, sub_traj_len=cfg.sub_traj_len),
         )
+        trainer.register_op("process_optim_batch", lambda batch: batch.to(device))
 
     if optim_scheduler is not None:
         trainer.register_op("post_optim", optim_scheduler.step)

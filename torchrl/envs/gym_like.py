@@ -6,18 +6,17 @@
 from __future__ import annotations
 
 import abc
+import itertools
 import warnings
-from typing import List, Optional, Sequence, Union, Tuple, Any, Dict
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
+from tensordict import TensorDict
+from tensordict.tensordict import TensorDictBase
 
-from torchrl.data import TensorDict
 from torchrl.data.tensor_specs import TensorSpec, UnboundedContinuousTensorSpec
-from torchrl.data.tensordict.tensordict import TensorDictBase
 from torchrl.envs.common import _EnvWrapper
-
-__all__ = ["GymLikeEnv", "default_info_dict_reader"]
 
 
 class BaseInfoDictReader(metaclass=abc.ABCMeta):
@@ -109,9 +108,9 @@ class GymLikeEnv(_EnvWrapper):
     In this implementation, the info output is discarded (but specific keys can be read
     by updating info_dict_reader, see :obj:`set_info_dict_reader` class method).
 
-    By default, the first output is written at the "next_observation" key-value pair in the output tensordict, unless
+    By default, the first output is written at the "observation" key-value pair in the output tensordict, unless
     the first output is a dictionary. In that case, each observation output will be put at the corresponding
-    "next_observation_{key}" location.
+    :obj:`f"{key}"` location for each :obj:`f"{key}"` of the dictionary.
 
     It is also expected that env.reset() returns an observation similar to the one observed after a step is completed.
     """
@@ -167,9 +166,9 @@ class GymLikeEnv(_EnvWrapper):
 
         """
         if isinstance(observations, dict):
-            observations = {"next_" + key: value for key, value in observations.items()}
+            observations = {key: value for key, value in observations.items()}
         if not isinstance(observations, (TensorDict, dict)):
-            key = list(self.observation_spec.keys())[0]
+            (key,) = itertools.islice(self.observation_spec.keys(), 1)
             observations = {key: observations}
         observations = self.observation_spec.encode(observations)
         return observations
@@ -221,6 +220,7 @@ class GymLikeEnv(_EnvWrapper):
         tensordict_out = TensorDict(
             obs_dict, batch_size=tensordict.batch_size, device=self.device
         )
+
         tensordict_out.set("reward", reward)
         tensordict_out.set("done", done)
         if self.info_dict_reader is not None and info is not None:

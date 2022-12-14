@@ -5,21 +5,14 @@
 
 
 import torch
+from packaging import version
 from torch import nn
 
 from torchrl.envs.utils import step_mdp
 from torchrl.modules.distributions import NormalParamWrapper
-from torchrl.modules.models import MLP
-from torchrl.modules.tensordict_module.common import TensorDictModule
-from torchrl.modules.tensordict_module.sequence import TensorDictSequential
-
-__all__ = [
-    "DreamerActor",
-    "ObsEncoder",
-    "ObsDecoder",
-    "RSSMPrior",
-    "RSSMPosterior",
-]
+from torchrl.modules.models.models import MLP
+from torchrl.modules.tensordict_module.common import SafeModule
+from torchrl.modules.tensordict_module.sequence import SafeSequential
 
 
 class DreamerActor(nn.Module):
@@ -158,15 +151,15 @@ class RSSMRollout(nn.Module):
     Reference: https://arxiv.org/abs/1811.04551
 
     Args:
-        rssm_prior (TensorDictModule): Prior network.
-        rssm_posterior (TensorDictModule): Posterior network.
+        rssm_prior (SafeModule): Prior network.
+        rssm_posterior (SafeModule): Posterior network.
 
 
     """
 
-    def __init__(self, rssm_prior: TensorDictModule, rssm_posterior: TensorDictModule):
+    def __init__(self, rssm_prior: SafeModule, rssm_posterior: SafeModule):
         super().__init__()
-        _module = TensorDictSequential(rssm_prior, rssm_posterior)
+        _module = SafeSequential(rssm_prior, rssm_posterior)
         self.in_keys = _module.in_keys
         self.out_keys = _module.out_keys
         self.rssm_prior = rssm_prior
@@ -197,17 +190,17 @@ class RSSMRollout(nn.Module):
         update_values = tensordict.exclude(*self.out_keys)
         for t in range(time_steps):
             # samples according to p(s_{t+1} | s_t, a_t, b_t)
-            # ["state", "belief", "action"] -> ["next_prior_mean", "next_prior_std", "_", "next_belief"]
+            # ["state", "belief", "action"] -> [("next", "prior_mean"), ("next", "prior_std"), "_", ("next", "belief")]
             self.rssm_prior(_tensordict)
 
             # samples according to p(s_{t+1} | s_t, a_t, o_{t+1}) = p(s_t | b_t, o_t)
-            # ["next_belief", "next_encoded_latents"] -> ["next_posterior_mean", "next_posterior_std", "next_state"]
+            # [("next", "belief"), ("next", "encoded_latents")] -> [("next", "posterior_mean"), ("next", "posterior_std"), ("next", "state")]
             self.rssm_posterior(_tensordict)
 
             tensordict_out.append(_tensordict)
             if t < time_steps - 1:
                 _tensordict = step_mdp(
-                    _tensordict.select(*self.out_keys), keep_other=False
+                    _tensordict.select(*self.out_keys, strict=False), keep_other=False
                 )
                 _tensordict = update_values[..., t + 1].update(_tensordict)
 
@@ -263,11 +256,23 @@ class RSSMPrior(nn.Module):
         self.state_dim = state_dim
         self.rnn_hidden_dim = rnn_hidden_dim
         self.action_shape = action_spec.shape
+        self._unsqueeze_rnn_input = version.parse(torch.__version__) < version.parse(
+            "1.11"
+        )
 
     def forward(self, state, belief, action):
         projector_input = torch.cat([state, action], dim=-1)
         action_state = self.action_state_projector(projector_input)
+        unsqueeze = False
+        if self._unsqueeze_rnn_input and action_state.ndimension() == 1:
+            if belief is not None:
+                belief = belief.unsqueeze(0)
+            action_state = action_state.unsqueeze(0)
+            unsqueeze = True
         belief = self.rnn(action_state, belief)
+        if unsqueeze:
+            belief = belief.squeeze(0)
+
         prior_mean, prior_std = self.rnn_to_prior_projector(belief)
         state = prior_mean + torch.randn_like(prior_std) * prior_std
         return prior_mean, prior_std, state, belief

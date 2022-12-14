@@ -7,11 +7,9 @@ import math
 from typing import Optional, Sequence, Union
 
 import torch
-from torch import nn, distributions as d
+from torch import distributions as d, nn
 from torch.nn.modules.lazy import LazyModuleMixin
 from torch.nn.parameter import UninitializedBuffer, UninitializedParameter
-
-__all__ = ["NoisyLinear", "NoisyLazyLinear", "reset_noise"]
 
 from torchrl._utils import prod
 from torchrl.data.utils import DEVICE_TYPING, DEVICE_TYPING_ARGS
@@ -265,19 +263,19 @@ class gSDEModule(nn.Module):
         device (DEVICE_TYPING, optional): device to create the model on.
 
     Examples:
-        >>> from torchrl.modules import TensorDictModule, TensorDictSequential, ProbabilisticActor, TanhNormal
-        >>> from torchrl.data import TensorDict
+        >>> from tensordict import TensorDict
+        >>> from torchrl.modules import SafeModule, SafeSequential, ProbabilisticActor, TanhNormal
         >>> batch, state_dim, action_dim = 3, 7, 5
         >>> model = nn.Linear(state_dim, action_dim)
-        >>> deterministic_policy = TensorDictModule(model, in_keys=["obs"], out_keys=["action"])
-        >>> stochatstic_part = TensorDictModule(
+        >>> deterministic_policy = SafeModule(model, in_keys=["obs"], out_keys=["action"])
+        >>> stochatstic_part = SafeModule(
         ...     gSDEModule(action_dim, state_dim),
         ...     in_keys=["action", "obs", "_eps_gSDE"],
         ...     out_keys=["loc", "scale", "action", "_eps_gSDE"])
         >>> stochatstic_part = ProbabilisticActor(stochatstic_part,
         ...      dist_in_keys=["loc", "scale"],
         ...      distribution_class=TanhNormal)
-        >>> stochatstic_policy = TensorDictSequential(deterministic_policy, stochatstic_part)
+        >>> stochatstic_policy = SafeSequential(deterministic_policy, stochatstic_part)
         >>> tensordict = TensorDict({'obs': torch.randn(state_dim), '_epx_gSDE': torch.zeros(1)}, [])
         >>> _ = stochatstic_policy(tensordict)
         >>> print(tensordict)

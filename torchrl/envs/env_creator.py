@@ -9,12 +9,10 @@ from collections import OrderedDict
 from typing import Callable, Dict, Optional, Union
 
 import torch
+from tensordict.tensordict import TensorDictBase
 
-from torchrl.data.tensordict.tensordict import TensorDictBase
 from torchrl.data.utils import CloudpickleWrapper
 from torchrl.envs.common import EnvBase, EnvMetaData
-
-__all__ = ["EnvCreator", "get_env_metadata"]
 
 
 class EnvCreator:
@@ -47,29 +45,29 @@ class EnvCreator:
         >>> env_creator = EnvCreator(env_fn)
         >>>
         >>> def test_env1(env_creator):
-        >>>     env = env_creator()
-        >>>     tensordict = env.reset()
-        >>>     for _ in range(10):
-        >>>         env.rand_step(tensordict)
-        >>>         if env.is_done:
-        >>>             tensordict = env.reset(tensordict)
-        >>>     print("env 1: ", env.transform._td.get("next_observation_count"))
+        ...     env = env_creator()
+        ...     tensordict = env.reset()
+        ...     for _ in range(10):
+        ...         env.rand_step(tensordict)
+        ...         if env.is_done:
+        ...             tensordict = env.reset(tensordict)
+        ...     print("env 1: ", env.transform._td.get(("next", "observation_count")))
         >>>
         >>> def test_env2(env_creator):
-        >>>     env = env_creator()
-        >>>     time.sleep(5)
-        >>>     print("env 2: ", env.transform._td.get("next_observation_count"))
+        ...     env = env_creator()
+        ...     time.sleep(5)
+        ...     print("env 2: ", env.transform._td.get(("next", "observation_count")))
         >>>
         >>> if __name__ == "__main__":
-        >>>     ps = []
-        >>>     p1 = mp.Process(target=test_env1, args=(env_creator,))
-        >>>     p1.start()
-        >>>     ps.append(p1)
-        >>>     p2 = mp.Process(target=test_env2, args=(env_creator,))
-        >>>     p2.start()
-        >>>     ps.append(p1)
-        >>>     for p in ps:
-        >>>         p.join()
+        ...     ps = []
+        ...     p1 = mp.Process(target=test_env1, args=(env_creator,))
+        ...     p1.start()
+        ...     ps.append(p1)
+        ...     p2 = mp.Process(target=test_env2, args=(env_creator,))
+        ...     p2.start()
+        ...     ps.append(p1)
+        ...     for p in ps:
+        ...         p.join()
         env 1:  tensor([11.9934])
         env 2:  tensor([11.9934])
     """
@@ -86,7 +84,7 @@ class EnvCreator:
             self.create_env_fn = create_env_fn
 
         self.create_env_kwargs = (
-            create_env_kwargs if isinstance(create_env_kwargs, dict) else dict()
+            create_env_kwargs if isinstance(create_env_kwargs, dict) else {}
         )
         self.initialized = False
         self._meta_data = None
@@ -161,6 +159,7 @@ class EnvCreator:
 
 
 def env_creator(fun: Callable) -> EnvCreator:
+    """Helper function to call `EnvCreator`."""
     return EnvCreator(fun)
 
 
@@ -175,7 +174,7 @@ def get_env_metadata(
     ):
         # then env is a creator
         if kwargs is None:
-            kwargs = dict()
+            kwargs = {}
         env = env_or_creator(**kwargs)
         return EnvMetaData.build_metadata_from_env(env)
     elif isinstance(env_or_creator, EnvCreator):

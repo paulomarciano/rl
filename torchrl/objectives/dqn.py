@@ -3,15 +3,17 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-import torch
+from typing import Union
 
-from torchrl.data import TensorDict
+import torch
+from tensordict import TensorDict
+from tensordict.tensordict import TensorDictBase
+from torch import nn
+
 from torchrl.envs.utils import step_mdp
-from torchrl.modules import (
-    DistributionalQValueActor,
-    QValueActor,
-)
-from ..data.tensordict.tensordict import TensorDictBase
+from torchrl.modules import DistributionalQValueActor, QValueActor
+from torchrl.modules.tensordict_module.common import ensure_tensordict_compatible
+
 from .common import LossModule
 from .utils import distance_loss, next_state_value
 
@@ -20,7 +22,7 @@ class DQNLoss(LossModule):
     """The DQN Loss class.
 
     Args:
-        value_network (ProbabilisticTDModule): a Q value operator.
+        value_network (QValueActor or nn.Module): a Q value operator.
         gamma (scalar): a discount factor for return computation.
         loss_function (str): loss function for the value discrepancy. Can be one of "l1", "l2" or "smooth_l1".
         delay_value (bool, optional): whether to duplicate the value network into a new target value network to
@@ -30,7 +32,7 @@ class DQNLoss(LossModule):
 
     def __init__(
         self,
-        value_network: QValueActor,
+        value_network: Union[QValueActor, nn.Module],
         gamma: float,
         loss_function: str = "l2",
         priority_key: str = "td_error",
@@ -39,6 +41,11 @@ class DQNLoss(LossModule):
 
         super().__init__()
         self.delay_value = delay_value
+
+        value_network = ensure_tensordict_compatible(
+            module=value_network, wrapper_type=QValueActor
+        )
+
         self.convert_to_functional(
             value_network,
             "value_network",
@@ -46,10 +53,7 @@ class DQNLoss(LossModule):
         )
 
         self.value_network_in_keys = value_network.in_keys
-        if not isinstance(value_network, QValueActor):
-            raise TypeError(
-                f"DQNLoss requires value_network to be of QValueActor dtype, got {type(value_network)}"
-            )
+
         self.register_buffer("gamma", torch.tensor(gamma))
         self.loss_function = loss_function
         self.priority_key = priority_key
@@ -87,10 +91,10 @@ class DQNLoss(LossModule):
         td_copy = tensordict.clone()
         if td_copy.device != tensordict.device:
             raise RuntimeError(f"{tensordict} and {td_copy} have different devices")
+        assert hasattr(self.value_network, "_is_stateless")
         self.value_network(
             td_copy,
             params=self.value_network_params,
-            buffers=self.value_network_buffers,
         )
 
         action = tensordict.get("action")
@@ -108,7 +112,6 @@ class DQNLoss(LossModule):
                 self.value_network,
                 gamma=self.gamma,
                 params=self.target_value_network_params,
-                buffers=self.target_value_network_buffers,
                 next_val_key="chosen_action_value",
             )
         priority_tensor = (pred_val_index - target_value).pow(2)
@@ -138,7 +141,7 @@ class DistributionalDQNLoss(LossModule):
     https://arxiv.org/pdf/1707.06887.pdf
 
     Args:
-        value_network (DistributionalQValueActor): the distributional Q
+        value_network (DistributionalQValueActor or nn.Module): the distributional Q
             value operator.
         gamma (scalar): a discount factor for return computation.
         delay_value (bool): whether to duplicate the value network into a new target value network to create double DQN
@@ -146,7 +149,7 @@ class DistributionalDQNLoss(LossModule):
 
     def __init__(
         self,
-        value_network: DistributionalQValueActor,
+        value_network: Union[DistributionalQValueActor, nn.Module],
         gamma: float,
         priority_key: str = "td_error",
         delay_value: bool = False,
@@ -155,12 +158,11 @@ class DistributionalDQNLoss(LossModule):
         self.register_buffer("gamma", torch.tensor(gamma))
         self.priority_key = priority_key
         self.delay_value = delay_value
-        if not isinstance(value_network, DistributionalQValueActor):
-            raise TypeError(
-                "Expected value_network to be of type "
-                "DistributionalQValueActor "
-                f"but got {type(value_network)}"
-            )
+
+        value_network = ensure_tensordict_compatible(
+            module=value_network, wrapper_type=DistributionalQValueActor
+        )
+
         self.convert_to_functional(
             value_network,
             "value_network",
@@ -198,7 +200,7 @@ class DistributionalDQNLoss(LossModule):
                 "tensordict as input"
             )
         batch_size = tensordict.batch_size[0]
-        support = self.value_network.support
+        support = self.value_network_params["support"]
         atoms = support.numel()
         Vmin = support.min().item()
         Vmax = support.max().item()
@@ -209,7 +211,7 @@ class DistributionalDQNLoss(LossModule):
         done = tensordict.get("done")
 
         steps_to_next_obs = tensordict.get("steps_to_next_obs", 1)
-        discount = self.gamma ** steps_to_next_obs
+        discount = self.gamma**steps_to_next_obs
 
         # Calculate current state probabilities (online network noise already
         # sampled)
@@ -217,7 +219,6 @@ class DistributionalDQNLoss(LossModule):
         self.value_network(
             td_clone,
             params=self.value_network_params,
-            buffers=self.value_network_buffers,
         )  # Log probabilities log p(s_t, ·; θonline)
         action_log_softmax = td_clone.get("action_value")
 
@@ -234,7 +235,6 @@ class DistributionalDQNLoss(LossModule):
             self.value_network(
                 next_td,
                 params=self.value_network_params,
-                buffers=self.value_network_buffers,
             )  # Probabilities p(s_t+n, ·; θonline)
 
             next_td_action = next_td.get("action")
@@ -246,7 +246,6 @@ class DistributionalDQNLoss(LossModule):
             self.value_network(
                 next_td,
                 params=self.target_value_network_params,
-                buffers=self.target_value_network_buffers,
             )  # Probabilities p(s_t+n, ·; θtarget)
             pns = next_td.get("action_value").exp()
             # Double-Q probabilities

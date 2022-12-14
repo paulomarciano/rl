@@ -8,7 +8,7 @@ import argparse
 import numpy as np
 import pytest
 import torch
-from _utils_internal import generate_seeds
+from _utils_internal import generate_seeds, PENDULUM_VERSIONED, PONG_VERSIONED
 from mocking_classes import (
     ContinuousActionVecMockEnv,
     DiscreteActionConvMockEnv,
@@ -17,6 +17,8 @@ from mocking_classes import (
     DiscreteActionVecPolicy,
     MockSerialEnv,
 )
+from tensordict.nn import TensorDictModule
+from tensordict.tensordict import assert_allclose_td, TensorDict
 from torch import nn
 from torchrl._utils import seed_generator
 from torchrl.collectors import aSyncDataCollector, SyncDataCollector
@@ -29,19 +31,12 @@ from torchrl.collectors.utils import split_trajectories
 from torchrl.data import (
     CompositeSpec,
     NdUnboundedContinuousTensorSpec,
-    TensorDict,
     UnboundedContinuousTensorSpec,
 )
-from torchrl.data.tensordict.tensordict import assert_allclose_td
 from torchrl.envs import EnvCreator, ParallelEnv, SerialEnv
 from torchrl.envs.libs.gym import _has_gym, GymEnv
 from torchrl.envs.transforms import TransformedEnv, VecNorm
-from torchrl.modules import (
-    Actor,
-    LSTMNet,
-    OrnsteinUhlenbeckProcessWrapper,
-    TensorDictModule,
-)
+from torchrl.modules import Actor, LSTMNet, OrnsteinUhlenbeckProcessWrapper, SafeModule
 
 # torch.set_default_dtype(torch.double)
 
@@ -299,16 +294,20 @@ def test_concurrent_collector_consistency(num_env, env_name, seed=40):
 @pytest.mark.skipif(not _has_gym, reason="gym library is not installed")
 def test_collector_env_reset():
     torch.manual_seed(0)
-    env = SerialEnv(2, lambda: GymEnv("ALE/Pong-v5", frame_skip=4))
+
+    def make_env():
+        return GymEnv(PONG_VERSIONED, frame_skip=4)
+
+    env = SerialEnv(2, make_env)
     # env = SerialEnv(3, lambda: GymEnv("CartPole-v1", frame_skip=4))
     env.set_seed(0)
     collector = SyncDataCollector(
         env, total_frames=10000, frames_per_batch=10000, split_trajs=False
     )
-    for data in collector:
+    for _data in collector:
         continue
-    steps = data["step_count"][..., 1:, :]
-    done = data["done"][..., :-1, :]
+    steps = _data["step_count"][..., 1:, :]
+    done = _data["done"][..., :-1, :]
     # we don't want just one done
     assert done.sum() > 3
     # check that after a done, the next step count is always 1
@@ -318,8 +317,8 @@ def test_collector_env_reset():
     # check that if step is 1, then the env was done before
     assert (steps == 1)[done].all()
     # check that split traj has a minimum total reward of -21 (for pong only)
-    data = split_trajectories(data)
-    assert data["reward"].sum(-2).min() == -21
+    _data = split_trajectories(_data)
+    assert _data["reward"].sum(-2).min() == -21
 
 
 @pytest.mark.parametrize("num_env", [1, 3])
@@ -578,9 +577,8 @@ def test_collector_consistency(num_env, env_name, seed=100):
 @pytest.mark.parametrize("collector_class", [SyncDataCollector, aSyncDataCollector])
 @pytest.mark.parametrize("env_name", ["conv", "vec"])
 def test_traj_len_consistency(num_env, env_name, collector_class, seed=100):
-    """
-    Tests that various frames_per_batch lead to the same results
-    """
+    """Tests that various frames_per_batch lead to the same results."""
+
     if num_env == 1:
 
         def env_fn(seed):
@@ -698,7 +696,7 @@ def test_collector_vecnorm_envcreator(static_seed):
     from torchrl.envs.libs.gym import GymEnv
 
     num_envs = 4
-    env_make = EnvCreator(lambda: TransformedEnv(GymEnv("Pendulum-v1"), VecNorm()))
+    env_make = EnvCreator(lambda: TransformedEnv(GymEnv(PENDULUM_VERSIONED), VecNorm()))
     env_make = ParallelEnv(num_envs, env_make)
 
     policy = RandomPolicy(env_make.action_spec)
@@ -752,7 +750,7 @@ def test_update_weights(use_async):
         return ContinuousActionVecMockEnv()
 
     n_actions = ContinuousActionVecMockEnv().action_spec.shape[-1]
-    policy = TensorDictModule(
+    policy = SafeModule(
         torch.nn.LazyLinear(n_actions), in_keys=["observation"], out_keys=["action"]
     )
     policy(create_env().reset())
@@ -822,7 +820,7 @@ def test_excluded_keys(collector_class, exclude):
         return ContinuousActionVecMockEnv()
 
     dummy_env = make_env()
-    obs_spec = dummy_env.observation_spec["next_observation"]
+    obs_spec = dummy_env.observation_spec["observation"]
     policy_module = nn.Linear(obs_spec.shape[-1], dummy_env.action_spec.shape[-1])
     policy = Actor(policy_module, spec=dummy_env.action_spec)
     policy_explore = OrnsteinUhlenbeckProcessWrapper(policy)
@@ -854,9 +852,9 @@ def test_excluded_keys(collector_class, exclude):
 @pytest.mark.parametrize(
     "collector_class",
     [
-        SyncDataCollector,
         MultiaSyncDataCollector,
         MultiSyncDataCollector,
+        SyncDataCollector,
     ],
 )
 @pytest.mark.parametrize("init_random_frames", [0, 50])
@@ -879,7 +877,13 @@ def test_collector_output_keys(collector_class, init_random_frames, explicit_spe
     policy_kwargs = {
         "module": net,
         "in_keys": ["observation", "hidden1", "hidden2"],
-        "out_keys": ["action", "hidden1", "hidden2", "next_hidden1", "next_hidden2"],
+        "out_keys": [
+            "action",
+            "hidden1",
+            "hidden2",
+            ("next", "hidden1"),
+            ("next", "hidden2"),
+        ],
     }
     if explicit_spec:
         hidden_spec = NdUnboundedContinuousTensorSpec((1, hidden_size))
@@ -887,13 +891,12 @@ def test_collector_output_keys(collector_class, init_random_frames, explicit_spe
             action=UnboundedContinuousTensorSpec(),
             hidden1=hidden_spec,
             hidden2=hidden_spec,
-            next_hidden1=hidden_spec,
-            next_hidden2=hidden_spec,
+            next=CompositeSpec(hidden1=hidden_spec, hidden2=hidden_spec),
         )
 
-    policy = TensorDictModule(**policy_kwargs)
+    policy = SafeModule(**policy_kwargs)
 
-    env_maker = lambda: GymEnv("Pendulum-v1")
+    env_maker = lambda: GymEnv(PENDULUM_VERSIONED)
 
     policy(env_maker().reset())
 
@@ -912,23 +915,24 @@ def test_collector_output_keys(collector_class, init_random_frames, explicit_spe
 
     collector = collector_class(**collector_kwargs)
 
-    keys = [
+    keys = {
         "action",
         "done",
         "hidden1",
         "hidden2",
         "mask",
-        "next_hidden1",
-        "next_hidden2",
-        "next_observation",
+        ("next", "hidden1"),
+        ("next", "hidden2"),
+        ("next", "observation"),
+        "next",
         "observation",
         "reward",
         "step_count",
         "traj_ids",
-    ]
+    }
     b = next(iter(collector))
 
-    assert set(b.keys()) == set(keys)
+    assert set(b.keys(True)) == keys
     collector.shutdown()
     del collector
 
@@ -949,7 +953,7 @@ class TestAutoWrap:
     def env_maker(self):
         from torchrl.envs.libs.gym import GymEnv
 
-        return lambda: GymEnv("Pendulum-v1")
+        return lambda: GymEnv(PENDULUM_VERSIONED)
 
     def _create_collector_kwargs(self, env_maker, collector_class, policy):
         collector_kwargs = {"create_env_fn": env_maker, "policy": policy}
